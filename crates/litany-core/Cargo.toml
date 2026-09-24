@@ -1,0 +1,16 @@
+[package]
+name = "litany-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Domain core for litany: tasks, recurrence rules, occurrences, streaks."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
