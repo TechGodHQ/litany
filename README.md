@@ -15,7 +15,7 @@ history, streaks. Part of the TechGodHQ fleet.
 
 - `Task` — name, optional due date, optional recurrence (`daily`,
   `every N days`, `weekly [on weekday]`, `every N weeks`, `monthly [on day]`,
-  `every N months`, `every N days from last completion`).
+  `every N months`, `every N days from last due date`).
 - `Occurrence` — one row per actual completion, with its real timestamp.
   Streaks and history are **derived** from occurrences; nothing stores a
   mutable counter that can drift from reality.
