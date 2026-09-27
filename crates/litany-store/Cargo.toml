@@ -1,0 +1,13 @@
+[package]
+name = "litany-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = "0.4"
+litany-core = { path = "../litany-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+
+[dev-dependencies]
