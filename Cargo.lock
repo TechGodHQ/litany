@@ -241,6 +241,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "litany-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "litany-core",
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
