@@ -8,6 +8,8 @@
 
 pub mod model;
 pub mod recurrence;
+pub mod streak;
 
 pub use model::{Occurrence, Recurrence, Task};
 pub use recurrence::next_due;
+pub use streak::{best, current};
