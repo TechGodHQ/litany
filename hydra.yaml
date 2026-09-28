@@ -1,0 +1,3 @@
+http_dispatch_fn: "crate::execute_operation_http"
+http_state_type: "crate::AppState"
+ts_client_name: "LitanyClient"

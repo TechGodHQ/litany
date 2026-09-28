@@ -1,0 +1,88 @@
+operations:
+  - name: task_create
+    description: Create a task with an explicit UTC anchor and optional due date or recurrence.
+    method: POST
+    path: /tasks
+    read: false
+    output_type: Task
+    parameters:
+      - { name: name, description: Task name, type: string, required: true, location: body }
+      - { name: due, description: Optional initial UTC due date (YYYY-MM-DD), type: string, required: false, location: body }
+      - name: recurrence
+        description: Optional recurrence JSON using Litany's tagged Recurrence model.
+        type: json
+        required: false
+        location: body
+        schema: { type: object }
+        cli: { flag: recurrence }
+      - { name: anchor, description: UTC anchor date (YYYY-MM-DD), type: string, required: true, location: body }
+      - { name: created_at, description: UTC creation timestamp (RFC3339 without offset), type: string, required: true, location: body }
+  - name: task_update
+    description: Replace a task's editable fields while preserving occurrence history.
+    method: POST
+    path: /tasks/{task_id}/update
+    read: false
+    output_type: Task
+    parameters:
+      - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
+      - { name: name, description: Replacement task name, type: string, required: true, location: body }
+      - { name: due, description: Optional replacement UTC due date, type: string, required: false, location: body }
+      - name: recurrence
+        description: Optional replacement recurrence JSON.
+        type: json
+        required: false
+        location: body
+        schema: { type: object }
+        cli: { flag: recurrence }
+      - { name: anchor, description: Replacement UTC anchor date, type: string, required: true, location: body }
+  - name: task_archive
+    description: Archive a task without deleting its occurrence history.
+    method: POST
+    path: /tasks/{task_id}/archive
+    read: false
+    output_type: Task
+    parameters:
+      - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
+  - name: task_list
+    description: List active tasks with explicit optional filters.
+    method: GET
+    path: /tasks
+    read: true
+    output_type: Vec<Task>
+    parameters:
+      - { name: due_before, description: Include only tasks due on or before this UTC date, type: string, required: false, location: query }
+      - { name: recurring, description: Include only recurring or non-recurring tasks, type: bool, required: false, location: query }
+  - name: task_complete
+    description: Record an occurrence against the task's current due date and advance recurrence atomically.
+    method: POST
+    path: /tasks/{task_id}/complete
+    read: false
+    output_type: Occurrence
+    parameters:
+      - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
+      - { name: at, description: UTC completion timestamp (RFC3339 without offset), type: string, required: true, location: body }
+  - name: tasks_due
+    description: List active tasks due on or before an explicit UTC date.
+    method: GET
+    path: /tasks/due
+    read: true
+    output_type: Vec<Task>
+    parameters:
+      - { name: as_of, description: UTC date to evaluate (YYYY-MM-DD), type: string, required: true, location: query }
+  - name: task_history
+    description: Return occurrence history for one task.
+    method: GET
+    path: /tasks/{task_id}/history
+    read: true
+    output_type: Vec<Occurrence>
+    parameters:
+      - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
+  - name: task_streak
+    description: Derive current and best recurrence streaks for a task at an explicit UTC date.
+    method: GET
+    path: /tasks/{task_id}/streak
+    read: true
+    output_type: Streak
+    parameters:
+      - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
+      - { name: as_of, description: UTC date for current streak evaluation, type: string, required: true, location: query }
