@@ -37,9 +37,14 @@ pub fn current(
         return 0;
     };
 
-    // A completion keeps the streak current through its own open period. Once
-    // the next due period has begun without a completion, grace is exhausted.
-    if next_due(rule, last_due, anchor).is_some_and(|next| next < as_of) {
+    // A completion keeps the streak current through the following open
+    // recurrence period. It expires only when the period after that begins
+    // without a completion. At the representable-date boundary, a missing
+    // following boundary leaves the known current period open rather than
+    // inventing an expiry.
+    let expires_at = next_due(rule, last_due, anchor)
+        .and_then(|open_period| next_due(rule, open_period, anchor));
+    if expires_at.is_some_and(|boundary| as_of >= boundary) {
         return 0;
     }
 
@@ -139,9 +144,26 @@ mod tests {
             current(&occurrences, &rule, initial_due, anchor, date(2026, 9, 3)),
             3
         );
+        // September 4 is the following open period, so the prior run remains
+        // current. It expires at the start of September 5 if September 4 is
+        // not completed.
         assert_eq!(
             current(&occurrences, &rule, initial_due, anchor, date(2026, 9, 4)),
             3
+        );
+        assert_eq!(
+            current(&occurrences, &rule, initial_due, anchor, date(2026, 9, 5)),
+            0
+        );
+        let with_sep4 = [
+            occurrence(date(2026, 9, 1), date(2026, 9, 1)),
+            occurrence(date(2026, 9, 2), date(2026, 9, 2)),
+            occurrence(date(2026, 9, 3), date(2026, 9, 3)),
+            occurrence(date(2026, 9, 4), date(2026, 9, 4)),
+        ];
+        assert_eq!(
+            current(&with_sep4, &rule, initial_due, anchor, date(2026, 9, 5)),
+            4
         );
         assert_eq!(best(&occurrences, &rule, initial_due, anchor), 3);
     }
@@ -200,6 +222,100 @@ mod tests {
             3
         );
         assert_eq!(best(&occurrences, &rule, initial_due, anchor), 3);
+    }
+
+    #[test]
+    fn six_week_grace_covers_the_full_open_period() {
+        let anchor = date(2026, 1, 1);
+        let rule = Recurrence::FromLast { days: 42 };
+        let january_only = [occurrence(anchor, anchor)];
+
+        for as_of in [date(2026, 2, 12), date(2026, 2, 13), date(2026, 3, 25)] {
+            assert_eq!(current(&january_only, &rule, anchor, anchor, as_of), 1);
+        }
+        assert_eq!(
+            current(&january_only, &rule, anchor, anchor, date(2026, 3, 26)),
+            0
+        );
+
+        let with_february = [
+            occurrence(anchor, anchor),
+            occurrence(date(2026, 2, 12), date(2026, 2, 12)),
+        ];
+        assert_eq!(
+            current(&with_february, &rule, anchor, anchor, date(2026, 3, 26)),
+            2
+        );
+        assert_eq!(best(&with_february, &rule, anchor, anchor), 2);
+    }
+
+    #[test]
+    fn recurrence_sized_open_period_grace_expires_at_the_following_boundary() {
+        let cases = [
+            (
+                Recurrence::Weekly { weekday: Some(0) },
+                date(2026, 1, 5),
+                [date(2026, 1, 12), date(2026, 1, 15), date(2026, 1, 18)],
+                date(2026, 1, 19),
+            ),
+            (
+                Recurrence::EveryNWeeks { n: 2 },
+                date(2026, 1, 5),
+                [date(2026, 1, 19), date(2026, 1, 26), date(2026, 2, 1)],
+                date(2026, 2, 2),
+            ),
+            (
+                Recurrence::EveryNDays { n: 10 },
+                date(2026, 1, 1),
+                [date(2026, 1, 11), date(2026, 1, 15), date(2026, 1, 20)],
+                date(2026, 1, 21),
+            ),
+        ];
+
+        for (rule, anchor, during_open_period, expiry) in cases {
+            let occurrences = [occurrence(anchor, anchor)];
+            for as_of in during_open_period {
+                assert_eq!(current(&occurrences, &rule, anchor, anchor, as_of), 1);
+            }
+            assert_eq!(current(&occurrences, &rule, anchor, anchor, expiry), 0);
+        }
+    }
+
+    #[test]
+    fn month_rules_keep_clamped_open_periods_current_and_restore_anchor_day() {
+        let anchor = date(2024, 1, 31);
+        let occurrences = [occurrence(anchor, anchor)];
+
+        for rule in [
+            Recurrence::Monthly { day: None },
+            Recurrence::EveryNMonths { n: 1 },
+        ] {
+            // February is clamped in a leap year; March restores the 31st.
+            assert_eq!(
+                current(&occurrences, &rule, anchor, anchor, date(2024, 2, 29)),
+                1
+            );
+            assert_eq!(
+                current(&occurrences, &rule, anchor, anchor, date(2024, 3, 30)),
+                1
+            );
+            assert_eq!(
+                current(&occurrences, &rule, anchor, anchor, date(2024, 3, 31)),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn unrepresentable_following_boundary_keeps_known_open_period_current() {
+        let max = NaiveDate::MAX;
+        let previous = max.pred_opt().expect("NaiveDate has a predecessor");
+        let occurrences = [occurrence(previous, previous)];
+
+        assert_eq!(
+            current(&occurrences, &Recurrence::Daily, previous, previous, max),
+            1
+        );
     }
 
     #[test]
