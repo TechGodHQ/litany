@@ -1,0 +1,24 @@
+[package]
+name = "litany-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+hydra-mcp-stdio = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.3.0" }
+litany-core = { path = "../litany-core" }
+litany-store = { path = "../litany-store" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+hydra-codegen = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.3.0" }

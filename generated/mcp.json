@@ -1,0 +1,225 @@
+{
+  "locations": {
+    "task_archive": {
+      "task_id": "path"
+    },
+    "task_complete": {
+      "at": "body",
+      "task_id": "path"
+    },
+    "task_create": {
+      "anchor": "body",
+      "created_at": "body",
+      "due": "body",
+      "name": "body",
+      "recurrence": "body"
+    },
+    "task_history": {
+      "task_id": "path"
+    },
+    "task_list": {
+      "due_before": "query",
+      "recurring": "query"
+    },
+    "task_streak": {
+      "as_of": "query",
+      "task_id": "path"
+    },
+    "task_update": {
+      "anchor": "body",
+      "due": "body",
+      "name": "body",
+      "recurrence": "body",
+      "task_id": "path"
+    },
+    "tasks_due": {
+      "as_of": "query"
+    }
+  },
+  "tools": [
+    {
+      "description": "Create a task with an explicit UTC anchor and optional due date or recurrence.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "anchor": {
+            "description": "UTC anchor date (YYYY-MM-DD)",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "UTC creation timestamp (RFC3339 without offset)",
+            "type": "string"
+          },
+          "due": {
+            "description": "Optional initial UTC due date (YYYY-MM-DD)",
+            "type": "string"
+          },
+          "name": {
+            "description": "Task name",
+            "type": "string"
+          },
+          "recurrence": {
+            "description": "Optional recurrence JSON using Litany's tagged Recurrence model.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "name",
+          "anchor",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "name": "task_create"
+    },
+    {
+      "description": "Replace a task's editable fields while preserving occurrence history.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "anchor": {
+            "description": "Replacement UTC anchor date",
+            "type": "string"
+          },
+          "due": {
+            "description": "Optional replacement UTC due date",
+            "type": "string"
+          },
+          "name": {
+            "description": "Replacement task name",
+            "type": "string"
+          },
+          "recurrence": {
+            "description": "Optional replacement recurrence JSON.",
+            "type": "object"
+          },
+          "task_id": {
+            "description": "Stable task ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "name",
+          "anchor"
+        ],
+        "type": "object"
+      },
+      "name": "task_update"
+    },
+    {
+      "description": "Archive a task without deleting its occurrence history.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "description": "Stable task ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "task_archive"
+    },
+    {
+      "description": "List active tasks with explicit optional filters.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "due_before": {
+            "description": "Include only tasks due on or before this UTC date",
+            "type": "string"
+          },
+          "recurring": {
+            "description": "Include only recurring or non-recurring tasks",
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "task_list"
+    },
+    {
+      "description": "Record an occurrence against the task's current due date and advance recurrence atomically.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "description": "UTC completion timestamp (RFC3339 without offset)",
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Stable task ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "at"
+        ],
+        "type": "object"
+      },
+      "name": "task_complete"
+    },
+    {
+      "description": "List active tasks due on or before an explicit UTC date.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of": {
+            "description": "UTC date to evaluate (YYYY-MM-DD)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "as_of"
+        ],
+        "type": "object"
+      },
+      "name": "tasks_due"
+    },
+    {
+      "description": "Return occurrence history for one task.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "description": "Stable task ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "task_history"
+    },
+    {
+      "description": "Derive current and best recurrence streaks for a task at an explicit UTC date.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of": {
+            "description": "UTC date for current streak evaluation",
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Stable task ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "as_of"
+        ],
+        "type": "object"
+      },
+      "name": "task_streak"
+    }
+  ]
+}

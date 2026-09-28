@@ -213,6 +213,11 @@ impl Store {
         })
     }
 
+    /// Fetch a task by its stable ID, including archived tasks.
+    pub fn get_task(&self, id: i64) -> Result<Option<Task>> {
+        self.task(id)
+    }
+
     fn task(&self, id: i64) -> Result<Option<Task>> {
         task_in_connection(&self.connection, id)
     }
