@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/litany-core", "crates/litany-store", "crates/litany-server"]
+members = [
+    "crates/litany-codegen",
+    "crates/litany-core",
+    "crates/litany-store",
+    "crates/litany-server",
+]
 
 [workspace.package]
 version = "0.1.0"
