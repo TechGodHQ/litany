@@ -40,6 +40,27 @@ fn run(root: &Path, command: &str) -> std::process::Output {
         .expect("run litany-codegen")
 }
 
+fn snapshot_artifacts(root: &Path) -> Vec<(bool, Option<Vec<u8>>)> {
+    ARTIFACTS
+        .iter()
+        .map(|artifact| {
+            let path = root.join(artifact);
+            (
+                path.exists(),
+                path.exists().then(|| fs::read(path).unwrap()),
+            )
+        })
+        .collect()
+}
+
+fn assert_artifacts_unchanged(root: &Path, before: &[(bool, Option<Vec<u8>>)]) {
+    assert_eq!(
+        before,
+        snapshot_artifacts(root),
+        "failed check must not create, remove, or rewrite artifacts"
+    );
+}
+
 #[test]
 fn check_accepts_clean_fixture_without_rewriting_artifacts() {
     let temp = fixture();
@@ -61,10 +82,11 @@ fn check_accepts_clean_fixture_without_rewriting_artifacts() {
 }
 
 #[test]
-fn check_reports_each_missing_or_stale_artifact() {
+fn failed_checks_preserve_each_missing_or_stale_artifact() {
     for artifact in ARTIFACTS {
         let temp = fixture();
         fs::remove_file(temp.path().join(artifact)).unwrap();
+        let before = snapshot_artifacts(temp.path());
         let output = run(temp.path(), "check");
         assert!(
             !output.status.success(),
@@ -75,9 +97,11 @@ fn check_reports_each_missing_or_stale_artifact() {
             diagnostic.contains(artifact),
             "diagnostic did not name {artifact}: {diagnostic}"
         );
+        assert_artifacts_unchanged(temp.path(), &before);
 
         let temp = fixture();
         fs::write(temp.path().join(artifact), "stale\n").unwrap();
+        let before = snapshot_artifacts(temp.path());
         let output = run(temp.path(), "check");
         assert!(
             !output.status.success(),
@@ -88,6 +112,7 @@ fn check_reports_each_missing_or_stale_artifact() {
             diagnostic.contains(artifact),
             "diagnostic did not name {artifact}: {diagnostic}"
         );
+        assert_artifacts_unchanged(temp.path(), &before);
     }
 }
 
@@ -95,9 +120,11 @@ fn check_reports_each_missing_or_stale_artifact() {
 fn invalid_definition_and_config_fail_at_the_process_boundary() {
     let temp = fixture();
     fs::write(temp.path().join("api/operations.yaml"), "operations:\n  - name: broken\n    description: nope\n    method: GET\n    path: /broken\n    read: true\n    output_type: String\n    parameters:\n      - { name: x, description: x, type: string, required: true, location: nonsense }\n").unwrap();
+    let before = snapshot_artifacts(temp.path());
     let output = run(temp.path(), "check");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("location"));
+    assert_artifacts_unchanged(temp.path(), &before);
 
     let temp = fixture();
     fs::write(
@@ -118,6 +145,31 @@ fn invalid_definition_and_config_fail_at_the_process_boundary() {
     let output = run(temp.path(), "write");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown hydra.yaml key"));
+}
+
+#[test]
+fn malformed_yaml_is_rejected_without_artifact_mutation() {
+    for (source, malformed) in [
+        ("api/operations.yaml", "operations: [\n"),
+        ("hydra.yaml", "http_dispatch_fn: [\n"),
+    ] {
+        for command in ["check", "write"] {
+            let temp = fixture();
+            fs::write(temp.path().join(source), malformed).unwrap();
+            let before = snapshot_artifacts(temp.path());
+            let output = run(temp.path(), command);
+            assert!(
+                !output.status.success(),
+                "malformed {source} unexpectedly passed {command}"
+            );
+            let diagnostic = String::from_utf8_lossy(&output.stderr).to_lowercase();
+            assert!(
+                diagnostic.contains("yaml") || diagnostic.contains("parse"),
+                "diagnostic was not a useful YAML parse failure for {source} {command}: {diagnostic}"
+            );
+            assert_artifacts_unchanged(temp.path(), &before);
+        }
+    }
 }
 
 #[test]
