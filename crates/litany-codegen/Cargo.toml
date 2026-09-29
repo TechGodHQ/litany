@@ -1,0 +1,15 @@
+[package]
+name = "litany-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+hydra-codegen = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.3.0" }
+hydra-core = { git = "https://github.com/TechGodHQ/hydra", tag = "v0.3.0" }
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

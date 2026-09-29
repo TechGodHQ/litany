@@ -13,6 +13,21 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: cargo run --locked -p litany-codegen -- check
+      - name: Verify deterministic generated artifacts
+        run: |
+          cargo run --locked -p litany-codegen -- write
+          git diff --exit-code -- generated
+          mkdir -p /tmp/litany-generated-first/ts-client
+          cp generated/cli.rs generated/http.rs generated/mcp.json /tmp/litany-generated-first/
+          cp generated/ts-client/index.ts /tmp/litany-generated-first/ts-client/
+          cargo run --locked -p litany-codegen -- write
+          cmp /tmp/litany-generated-first/cli.rs generated/cli.rs
+          cmp /tmp/litany-generated-first/http.rs generated/http.rs
+          cmp /tmp/litany-generated-first/mcp.json generated/mcp.json
+          cmp /tmp/litany-generated-first/ts-client/index.ts generated/ts-client/index.ts
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
