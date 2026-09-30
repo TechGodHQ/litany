@@ -6,6 +6,7 @@ RUN cargo build --release --locked -p litany-server --bin litany-http
 
 FROM debian:bookworm-slim
 
+# litany-store uses rusqlite's bundled SQLite feature; no system libsqlite runtime is needed.
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
