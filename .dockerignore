@@ -1,0 +1,9 @@
+target/
+.git/
+.creed/
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

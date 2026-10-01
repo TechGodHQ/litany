@@ -258,6 +258,13 @@ pub async fn execute_operation_http(
 pub fn http_router(state: AppState) -> Router {
     generated::generated_router().with_state(state)
 }
+const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8941";
+fn http_bind_from(value: Option<String>) -> String {
+    value.unwrap_or_else(|| DEFAULT_HTTP_BIND.to_owned())
+}
+fn configured_http_bind() -> String {
+    http_bind_from(std::env::var("LITANY_HTTP_BIND").ok())
+}
 
 pub async fn run_cli() -> anyhow::Result<()> {
     use clap::Parser;
@@ -310,7 +317,8 @@ pub async fn run_cli() -> anyhow::Result<()> {
 }
 pub async fn run_http() -> anyhow::Result<()> {
     let db = std::env::var("LITANY_DB").unwrap_or_else(|_| "litany.db".into());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8941").await?;
+    let bind = configured_http_bind();
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, http_router(AppState::open(db)?)).await?;
     Ok(())
 }
@@ -367,6 +375,16 @@ pub async fn run_mcp() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_bind_defaults_to_loopback_and_accepts_container_override() {
+        assert_eq!(http_bind_from(None), DEFAULT_HTTP_BIND);
+        assert_eq!(
+            http_bind_from(Some("0.0.0.0:8941".to_owned())),
+            "0.0.0.0:8941"
+        );
+    }
+
     #[tokio::test]
     async fn create_complete_and_streak_share_the_generated_dispatch_contract() {
         let state = AppState::in_memory();
