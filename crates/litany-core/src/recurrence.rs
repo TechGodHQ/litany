@@ -2,7 +2,7 @@
 
 use chrono::{Datelike, NaiveDate};
 
-use crate::model::Recurrence;
+use crate::model::{AdvanceMode, Recurrence};
 
 /// Compute the next due date strictly after `from`, given a rule.
 ///
@@ -80,23 +80,78 @@ pub fn next_due(rule: &Recurrence, from: NaiveDate, anchor: NaiveDate) -> Option
     }
 }
 
+/// Advance one scheduled due according to the selected collapse mode.
+///
+/// Stacking callers should continue to use [`next_due`] directly. In slide
+/// mode, the full interval is measured from `from`; monthly intervals preserve
+/// and clamp the date being advanced rather than restoring the original
+/// anchor day.
+pub fn next_due_for_mode(
+    rule: &Recurrence,
+    from: NaiveDate,
+    anchor: NaiveDate,
+    mode: AdvanceMode,
+) -> Option<NaiveDate> {
+    if mode == AdvanceMode::Anchor {
+        return next_due(rule, from, anchor);
+    }
+
+    // Keep the same validation contract as the anchor schedule, including
+    // invalid weekdays, month days, and zero-length recurrence intervals.
+    next_due(rule, from, anchor)?;
+
+    use Recurrence::*;
+    match rule {
+        Daily => from.succ_opt(),
+        EveryNDays { n } | FromLast { days: n } => {
+            from.checked_add_signed(chrono::Duration::days(i64::from(*n)))
+        }
+        Weekly { .. } => from.checked_add_signed(chrono::Duration::days(7)),
+        EveryNWeeks { n } => from.checked_add_signed(chrono::Duration::days(i64::from(*n) * 7)),
+        Monthly { .. } => add_months_clamped(from, 1, from.day()),
+        EveryNMonths { n } => add_months_clamped(from, *n, from.day()),
+    }
+}
+
+/// Find the most recent scheduled due on or before `completed_on`, beginning
+/// with the task's outstanding due. If completion is early, the outstanding
+/// due is returned unchanged and no future period is consumed.
+pub fn most_recent_satisfied_due(
+    rule: &Recurrence,
+    outstanding_due: NaiveDate,
+    anchor: NaiveDate,
+    completed_on: NaiveDate,
+    mode: AdvanceMode,
+) -> NaiveDate {
+    if completed_on < outstanding_due {
+        return outstanding_due;
+    }
+
+    let mut latest = outstanding_due;
+    while let Some(next) = next_due_for_mode(rule, latest, anchor, mode) {
+        if next > completed_on {
+            break;
+        }
+        latest = next;
+    }
+    latest
+}
+
 /// First date strictly after `from` whose day-of-month is `d` (clamped to
 /// month length). The result is always in the month following `from`'s.
 fn next_monthday(from: NaiveDate, d: u32) -> Option<NaiveDate> {
-    let y = from.year();
-    let m = from.month();
-    let (ny, nm) = next_month(y, m)?;
-    let last = days_in_month_opt(ny, nm)?;
-    NaiveDate::from_ymd_opt(ny, nm, d.min(last))
+    add_months_clamped(from, 1, d)
 }
 
-/// The month after `y`-`m`, checked at the year boundary.
-fn next_month(y: i32, m: u32) -> Option<(i32, u32)> {
-    if m == 12 {
-        Some((y.checked_add(1)?, 1))
-    } else {
-        Some((y, m + 1))
+fn add_months_clamped(from: NaiveDate, months: u32, day: u32) -> Option<NaiveDate> {
+    if months == 0 {
+        return None;
     }
+    let month_index = i64::from(from.year()) * 12 + i64::from(from.month() - 1) + i64::from(months);
+    let year = i32::try_from(month_index.div_euclid(12)).ok()?;
+    let month = u32::try_from(month_index.rem_euclid(12) + 1).ok()?;
+    let last = days_in_month_opt(year, month)?;
+    NaiveDate::from_ymd_opt(year, month, day.min(last))
 }
 
 /// Days in a month, leap-aware. Total: a table lookup with no next-month
@@ -416,5 +471,235 @@ mod tests {
         let anchor = d(2020, 1, 1); // anchor irrelevant for FromLast
         let next = next_due(&Recurrence::FromLast { days: 42 }, from, anchor).unwrap();
         assert_eq!(next, d(2026, 10, 13));
+    }
+
+    #[test]
+    fn omitted_task_settings_default_to_legacy_stacking_and_anchor() {
+        let legacy = serde_json::json!({
+            "id": 1,
+            "name": "legacy",
+            "due": "2026-11-01",
+            "recurrence": {"kind": "daily"},
+            "anchor": "2026-11-01",
+            "created_at": "2026-10-01T00:00:00",
+            "archived": false
+        });
+        let task: crate::Task = serde_json::from_value(legacy).unwrap();
+        assert!(!task.collapse);
+        assert_eq!(task.advance, AdvanceMode::Anchor);
+    }
+
+    #[test]
+    fn slide_mode_uses_full_intervals_from_the_date_being_advanced() {
+        let wed = d(2026, 9, 23);
+        assert_eq!(
+            next_due_for_mode(
+                &Recurrence::Weekly { weekday: Some(6) },
+                wed,
+                wed,
+                AdvanceMode::Slide
+            ),
+            Some(d(2026, 9, 30))
+        );
+        let jan31 = d(2026, 1, 31);
+        let feb28 = d(2026, 2, 28);
+        assert_eq!(
+            next_due_for_mode(
+                &Recurrence::Monthly { day: Some(31) },
+                jan31,
+                jan31,
+                AdvanceMode::Slide
+            ),
+            Some(feb28)
+        );
+        assert_eq!(
+            next_due_for_mode(
+                &Recurrence::Monthly { day: Some(31) },
+                feb28,
+                jan31,
+                AdvanceMode::Slide
+            ),
+            Some(d(2026, 3, 28))
+        );
+        assert_eq!(
+            next_due_for_mode(
+                &Recurrence::EveryNMonths { n: 2 },
+                jan31,
+                jan31,
+                AdvanceMode::Slide
+            ),
+            Some(d(2026, 3, 31))
+        );
+    }
+
+    #[test]
+    fn collapse_finds_latest_due_without_backfilling_and_preserves_early_due() {
+        let nov1 = d(2026, 11, 1);
+        assert_eq!(
+            most_recent_satisfied_due(
+                &Recurrence::Daily,
+                nov1,
+                nov1,
+                d(2026, 11, 5),
+                AdvanceMode::Anchor
+            ),
+            d(2026, 11, 5)
+        );
+        assert_eq!(
+            next_due_for_mode(
+                &Recurrence::Daily,
+                d(2026, 11, 5),
+                nov1,
+                AdvanceMode::Anchor
+            ),
+            Some(d(2026, 11, 6))
+        );
+        assert_eq!(
+            most_recent_satisfied_due(
+                &Recurrence::EveryNDays { n: 2 },
+                nov1,
+                nov1,
+                d(2026, 11, 6),
+                AdvanceMode::Anchor
+            ),
+            d(2026, 11, 5)
+        );
+        assert_eq!(
+            most_recent_satisfied_due(
+                &Recurrence::Daily,
+                nov1,
+                nov1,
+                d(2026, 10, 31),
+                AdvanceMode::Slide
+            ),
+            nov1
+        );
+    }
+
+    #[test]
+    fn anchor_and_slide_collapse_walk_their_own_monthly_schedules() {
+        let jan31 = d(2026, 1, 31);
+        let apr30 = d(2026, 4, 30);
+        let rule = Recurrence::Monthly { day: Some(31) };
+        assert_eq!(
+            most_recent_satisfied_due(&rule, jan31, jan31, apr30, AdvanceMode::Anchor),
+            apr30
+        );
+        assert_eq!(
+            most_recent_satisfied_due(&rule, jan31, jan31, apr30, AdvanceMode::Slide),
+            d(2026, 4, 28)
+        );
+        assert_eq!(
+            next_due_for_mode(&rule, apr30, jan31, AdvanceMode::Anchor),
+            Some(d(2026, 5, 31))
+        );
+        assert_eq!(
+            next_due_for_mode(&rule, apr30, jan31, AdvanceMode::Slide),
+            Some(d(2026, 5, 30))
+        );
+    }
+
+    #[test]
+    fn collapse_walking_covers_every_recurrence_family() {
+        let cases = [
+            (
+                Recurrence::Daily,
+                d(2026, 11, 1),
+                d(2026, 11, 5),
+                d(2026, 11, 5),
+            ),
+            (
+                Recurrence::EveryNDays { n: 2 },
+                d(2026, 11, 1),
+                d(2026, 11, 6),
+                d(2026, 11, 5),
+            ),
+            (
+                Recurrence::Weekly { weekday: Some(0) },
+                d(2026, 9, 23),
+                d(2026, 10, 4),
+                d(2026, 9, 28),
+            ),
+            (
+                Recurrence::EveryNWeeks { n: 2 },
+                d(2026, 9, 1),
+                d(2026, 10, 1),
+                d(2026, 9, 29),
+            ),
+            (
+                Recurrence::Monthly { day: Some(31) },
+                d(2026, 1, 31),
+                d(2026, 3, 15),
+                d(2026, 2, 28),
+            ),
+            (
+                Recurrence::EveryNMonths { n: 2 },
+                d(2026, 1, 31),
+                d(2026, 4, 15),
+                d(2026, 3, 31),
+            ),
+            (
+                Recurrence::FromLast { days: 42 },
+                d(2026, 1, 1),
+                d(2026, 4, 1),
+                d(2026, 3, 26),
+            ),
+        ];
+
+        for (rule, outstanding, completed, expected) in cases {
+            assert_eq!(
+                most_recent_satisfied_due(
+                    &rule,
+                    outstanding,
+                    outstanding,
+                    completed,
+                    AdvanceMode::Anchor
+                ),
+                expected,
+                "wrong latest due for {rule:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slide_intervals_cover_each_recurrence_family_and_leap_clamping() {
+        let wed = d(2026, 9, 23);
+        let cases = [
+            (Recurrence::Daily, wed, d(2026, 9, 24)),
+            (Recurrence::EveryNDays { n: 3 }, wed, d(2026, 9, 26)),
+            (Recurrence::Weekly { weekday: Some(6) }, wed, d(2026, 9, 30)),
+            (Recurrence::EveryNWeeks { n: 2 }, wed, d(2026, 10, 7)),
+            (Recurrence::FromLast { days: 42 }, wed, d(2026, 11, 4)),
+            (
+                Recurrence::EveryNMonths { n: 2 },
+                d(2026, 1, 31),
+                d(2026, 3, 31),
+            ),
+        ];
+        for (rule, from, expected) in cases {
+            assert_eq!(
+                next_due_for_mode(&rule, from, from, AdvanceMode::Slide),
+                Some(expected),
+                "wrong slide interval for {rule:?}"
+            );
+        }
+        assert_eq!(
+            next_due_for_mode(
+                &Recurrence::Monthly { day: Some(31) },
+                d(2024, 1, 31),
+                d(2024, 1, 31),
+                AdvanceMode::Slide
+            ),
+            Some(d(2024, 2, 29))
+        );
+        assert_eq!(
+            next_due_for_mode(
+                &Recurrence::Monthly { day: Some(31) },
+                d(2024, 2, 29),
+                d(2024, 1, 31),
+                AdvanceMode::Slide
+            ),
+            Some(d(2024, 3, 29))
+        );
     }
 }

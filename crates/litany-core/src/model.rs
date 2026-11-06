@@ -3,6 +3,22 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
+/// How a collapsed completion advances the recurrence schedule.
+///
+/// `Anchor` preserves the recurrence's configured calendar anchor. `Slide`
+/// advances by one full recurrence interval from the completion date. This
+/// setting is meaningful when `Task::collapse` is enabled; ordinary stacking
+/// retains the legacy due-date advancement behavior.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvanceMode {
+    /// Keep the existing recurrence grid anchored to its configured weekday/day.
+    #[default]
+    Anchor,
+    /// Start a full recurrence interval from the completion date.
+    Slide,
+}
+
 /// How a task repeats. `None` on the task = one-shot / no-due task.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -37,6 +53,13 @@ pub struct Task {
     pub recurrence: Option<Recurrence>,
     /// Anchor date for rules that need a starting point.
     pub anchor: NaiveDate,
+    /// When true, one completion may collapse multiple overdue scheduled dues
+    /// into one occurrence. Missing fields from legacy inputs default to false.
+    #[serde(default)]
+    pub collapse: bool,
+    /// Advance mode for collapsed completions. Legacy inputs default to anchor.
+    #[serde(default)]
+    pub advance: AdvanceMode,
     pub created_at: NaiveDateTime,
     pub archived: bool,
 }

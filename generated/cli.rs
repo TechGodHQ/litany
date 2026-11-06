@@ -14,7 +14,7 @@ pub enum GeneratedCommand {
     TaskArchive(TaskArchiveArgs),
     /// List active tasks with explicit optional filters.
     TaskList(TaskListArgs),
-    /// Record an occurrence against the task's current due date and advance recurrence atomically.
+    /// Record one occurrence and advance recurrence atomically; overdue collapse attributes it to the latest scheduled due on or before the completion UTC date.
     TaskComplete(TaskCompleteArgs),
     /// List active tasks due on or before an explicit UTC date.
     TasksDue(TasksDueArgs),
@@ -40,8 +40,8 @@ impl GeneratedCommand {
 
     pub fn parameters_json(&self) -> serde_json::Value {
         match self {
-            Self::TaskCreate(args) => serde_json::json!({"name": args.name.clone(), "due": args.due.clone(), "recurrence": args.recurrence.clone(), "anchor": args.anchor.clone(), "created_at": args.created_at.clone()}),
-            Self::TaskUpdate(args) => serde_json::json!({"task_id": args.task_id.clone(), "name": args.name.clone(), "due": args.due.clone(), "recurrence": args.recurrence.clone(), "anchor": args.anchor.clone()}),
+            Self::TaskCreate(args) => serde_json::json!({"name": args.name.clone(), "due": args.due.clone(), "recurrence": args.recurrence.clone(), "anchor": args.anchor.clone(), "collapse": args.collapse.clone(), "advance": args.advance.clone(), "created_at": args.created_at.clone()}),
+            Self::TaskUpdate(args) => serde_json::json!({"task_id": args.task_id.clone(), "name": args.name.clone(), "due": args.due.clone(), "recurrence": args.recurrence.clone(), "anchor": args.anchor.clone(), "collapse": args.collapse.clone(), "advance": args.advance.clone()}),
             Self::TaskArchive(args) => serde_json::json!({"task_id": args.task_id.clone()}),
             Self::TaskList(args) => serde_json::json!({"due_before": args.due_before.clone(), "recurring": args.recurring.clone()}),
             Self::TaskComplete(args) => serde_json::json!({"task_id": args.task_id.clone(), "at": args.at.clone()}),
@@ -66,6 +66,12 @@ pub struct TaskCreateArgs {
     /// UTC anchor date (YYYY-MM-DD)
     #[arg(long)]
     pub anchor: String,
+    /// Collapse overdue scheduled dues into one completion; defaults to stacking behavior.
+    #[arg(long = "collapse")]
+    pub collapse: Option<bool>,
+    /// Anchor or slide mode for collapsed completions; defaults to anchor.
+    #[arg(long = "advance")]
+    pub advance: Option<String>,
     /// UTC creation timestamp (RFC3339 without offset)
     #[arg(long)]
     pub created_at: String,
@@ -87,6 +93,12 @@ pub struct TaskUpdateArgs {
     /// Replacement UTC anchor date
     #[arg(long)]
     pub anchor: String,
+    /// Replacement overdue-collapse setting; omitted updates preserve the current value.
+    #[arg(long = "collapse")]
+    pub collapse: Option<bool>,
+    /// Replacement anchor or slide mode for collapsed completions; omitted updates preserve the current value.
+    #[arg(long = "advance")]
+    pub advance: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]

@@ -10,6 +10,6 @@ pub mod model;
 pub mod recurrence;
 pub mod streak;
 
-pub use model::{Occurrence, Recurrence, Task};
-pub use recurrence::next_due;
+pub use model::{AdvanceMode, Occurrence, Recurrence, Task};
+pub use recurrence::{most_recent_satisfied_due, next_due, next_due_for_mode};
 pub use streak::{best, current};

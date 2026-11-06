@@ -16,6 +16,18 @@ operations:
         schema: { type: object }
         cli: { flag: recurrence }
       - { name: anchor, description: UTC anchor date (YYYY-MM-DD), type: string, required: true, location: body }
+      - name: collapse
+        description: Collapse overdue scheduled dues into one completion; defaults to stacking behavior.
+        type: bool
+        required: false
+        location: body
+        cli: { flag: collapse }
+      - name: advance
+        description: Anchor or slide mode for collapsed completions; defaults to anchor.
+        type: string
+        required: false
+        location: body
+        cli: { flag: advance }
       - { name: created_at, description: UTC creation timestamp (RFC3339 without offset), type: string, required: true, location: body }
   - name: task_update
     description: Replace a task's editable fields while preserving occurrence history.
@@ -35,6 +47,18 @@ operations:
         schema: { type: object }
         cli: { flag: recurrence }
       - { name: anchor, description: Replacement UTC anchor date, type: string, required: true, location: body }
+      - name: collapse
+        description: Replacement overdue-collapse setting; omitted updates preserve the current value.
+        type: bool
+        required: false
+        location: body
+        cli: { flag: collapse }
+      - name: advance
+        description: Replacement anchor or slide mode for collapsed completions; omitted updates preserve the current value.
+        type: string
+        required: false
+        location: body
+        cli: { flag: advance }
   - name: task_archive
     description: Archive a task without deleting its occurrence history.
     method: POST
@@ -53,7 +77,7 @@ operations:
       - { name: due_before, description: Include only tasks due on or before this UTC date, type: string, required: false, location: query }
       - { name: recurring, description: Include only recurring or non-recurring tasks, type: bool, required: false, location: query }
   - name: task_complete
-    description: Record an occurrence against the task's current due date and advance recurrence atomically.
+    description: Record one occurrence and advance recurrence atomically; overdue collapse attributes it to the latest scheduled due on or before the completion UTC date.
     method: POST
     path: /tasks/{task_id}/complete
     read: false

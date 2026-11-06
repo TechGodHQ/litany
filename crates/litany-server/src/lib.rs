@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::{http::StatusCode, response::IntoResponse, Router};
 use chrono::{NaiveDate, NaiveDateTime};
-use litany_core::{streak, Recurrence, Task};
+use litany_core::{streak, AdvanceMode, Recurrence, Task};
 use litany_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -102,6 +102,8 @@ struct Create {
     due: Option<String>,
     recurrence: Option<Value>,
     anchor: String,
+    collapse: Option<bool>,
+    advance: Option<AdvanceMode>,
     created_at: String,
 }
 #[derive(Deserialize)]
@@ -110,6 +112,8 @@ struct Update {
     due: Option<String>,
     recurrence: Option<Value>,
     anchor: String,
+    collapse: Option<bool>,
+    advance: Option<AdvanceMode>,
 }
 #[derive(Deserialize)]
 struct Complete {
@@ -138,6 +142,8 @@ pub async fn execute_operation(
                     due: args.due.as_deref().map(date).transpose()?,
                     recurrence: recurrence(args.recurrence)?,
                     anchor: date(&args.anchor)?,
+                    collapse: args.collapse.unwrap_or_default(),
+                    advance: args.advance.unwrap_or_default(),
                     created_at: timestamp(&args.created_at)?,
                     archived: false,
                 })
@@ -157,6 +163,8 @@ pub async fn execute_operation(
                 due: args.due.as_deref().map(date).transpose()?,
                 recurrence: recurrence(args.recurrence)?,
                 anchor: date(&args.anchor)?,
+                collapse: args.collapse.unwrap_or(existing.collapse),
+                advance: args.advance.unwrap_or(existing.advance),
                 created_at: existing.created_at,
                 archived: existing.archived,
             };
@@ -229,8 +237,23 @@ pub async fn execute_operation(
                 .or(task.due)
                 .ok_or_else(|| bad("recurring task lacks due date"))?;
             value(Streak {
-                current: streak::current(&history, rule, initial_due, task.anchor, as_of),
-                best: streak::best(&history, rule, initial_due, task.anchor),
+                current: streak::current_with_settings(
+                    &history,
+                    rule,
+                    initial_due,
+                    task.anchor,
+                    as_of,
+                    task.collapse,
+                    task.advance,
+                ),
+                best: streak::best_with_settings(
+                    &history,
+                    rule,
+                    initial_due,
+                    task.anchor,
+                    task.collapse,
+                    task.advance,
+                ),
                 unit: streak_unit(rule),
             })
         }
@@ -390,6 +413,8 @@ mod tests {
         let state = AppState::in_memory();
         let create=execute_operation(&state,"task_create",generated::GeneratedOperationInput{path:BTreeMap::new(),query:BTreeMap::new(),body:json!({"name":"walk","due":"2026-09-28","recurrence":{"kind":"daily"},"anchor":"2026-09-28","created_at":"2026-09-28T00:00:00"})}).await.unwrap();
         let id = create["id"].as_i64().unwrap().to_string();
+        assert_eq!(create["collapse"], false);
+        assert_eq!(create["advance"], "anchor");
         let mut path = BTreeMap::new();
         path.insert("task_id".into(), id.clone());
         execute_operation(
@@ -418,5 +443,354 @@ mod tests {
         .unwrap();
         assert_eq!(streak["current"], 1);
         assert_eq!(streak["best"], 1);
+    }
+
+    async fn http_json(
+        state: &AppState,
+        method: axum::http::Method,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+            .unwrap();
+        let response = http_router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn generated_http_round_trips_settings_and_preserves_them_on_replacement_update() {
+        use axum::http::Method;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("litany.db");
+        let state = AppState::open(&database).unwrap();
+        let (status, created) = http_json(
+            &state,
+            Method::POST,
+            "/tasks",
+            Some(json!({
+                "name": "synthetic walk",
+                "due": "2026-11-01",
+                "recurrence": {"kind": "daily"},
+                "anchor": "2026-11-01",
+                "collapse": true,
+                "advance": "slide",
+                "created_at": "2026-10-01T00:00:00"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let id = created["id"].as_i64().unwrap();
+        assert_eq!(created["collapse"], true);
+        assert_eq!(created["advance"], "slide");
+
+        // Legacy clients send only the original replacement fields. The new
+        // optional settings must survive unchanged rather than resetting.
+        let (status, updated) = http_json(
+            &state,
+            Method::POST,
+            &format!("/tasks/{id}/update"),
+            Some(json!({
+                "name": "renamed synthetic walk",
+                "due": "2026-11-01",
+                "recurrence": {"kind": "daily"},
+                "anchor": "2026-11-01"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["collapse"], true);
+        assert_eq!(updated["advance"], "slide");
+
+        let (status, completed) = http_json(
+            &state,
+            Method::POST,
+            &format!("/tasks/{id}/complete"),
+            Some(json!({"at": "2026-11-05T23:59:12"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        assert_eq!(completed["due_date"], "2026-11-05");
+        assert_eq!(completed["completed_at"], "2026-11-05T23:59:12");
+        drop(state);
+
+        // A fresh connection proves the schema migration and settings/history
+        // survive SQLite close/reopen without accessing any live data.
+        let reopened = AppState::open(&database).unwrap();
+        let (status, tasks) = http_json(&reopened, Method::GET, "/tasks", None).await;
+        assert_eq!(status, StatusCode::OK, "{tasks}");
+        assert_eq!(tasks.as_array().unwrap().len(), 1);
+        assert_eq!(tasks[0]["collapse"], true);
+        assert_eq!(tasks[0]["advance"], "slide");
+        assert_eq!(tasks[0]["due"], "2026-11-06");
+
+        let (status, history) = http_json(
+            &reopened,
+            Method::GET,
+            &format!("/tasks/{id}/history"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        assert_eq!(history[0]["due_date"], "2026-11-05");
+        assert_eq!(history[0]["completed_at"], "2026-11-05T23:59:12");
+    }
+
+    #[tokio::test]
+    async fn generated_http_streaks_follow_slide_intervals_without_repairing_gaps() {
+        use axum::http::Method;
+
+        let state = AppState::in_memory();
+        let (status, continuous) = http_json(
+            &state,
+            Method::POST,
+            "/tasks",
+            Some(json!({
+                "name": "synthetic continuous slide",
+                "due": "2026-01-31",
+                "recurrence": {"kind": "monthly", "day": 31},
+                "anchor": "2026-01-31",
+                "collapse": true,
+                "advance": "slide",
+                "created_at": "2026-01-01T00:00:00"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{continuous}");
+        let continuous_id = continuous["id"].as_i64().unwrap();
+        for (at, expected_due) in [
+            ("2026-01-31T12:00:00", "2026-01-31"),
+            ("2026-02-28T12:00:00", "2026-02-28"),
+            ("2026-03-28T12:00:00", "2026-03-28"),
+        ] {
+            let (status, occurrence) = http_json(
+                &state,
+                Method::POST,
+                &format!("/tasks/{continuous_id}/complete"),
+                Some(json!({"at": at})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{occurrence}");
+            assert_eq!(occurrence["due_date"], expected_due);
+        }
+        let (status, streak) = http_json(
+            &state,
+            Method::GET,
+            &format!("/tasks/{continuous_id}/streak?as_of=2026-04-29"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{streak}");
+        assert_eq!(streak["current"], 3);
+        assert_eq!(streak["best"], 3);
+
+        let (status, gapped) = http_json(
+            &state,
+            Method::POST,
+            "/tasks",
+            Some(json!({
+                "name": "synthetic gapped slide",
+                "due": "2026-01-31",
+                "recurrence": {"kind": "monthly", "day": 31},
+                "anchor": "2026-01-31",
+                "collapse": true,
+                "advance": "slide",
+                "created_at": "2026-01-01T00:00:00"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{gapped}");
+        let gapped_id = gapped["id"].as_i64().unwrap();
+        for at in ["2026-01-31T12:00:00", "2026-02-28T12:00:00"] {
+            let (status, occurrence) = http_json(
+                &state,
+                Method::POST,
+                &format!("/tasks/{gapped_id}/complete"),
+                Some(json!({"at": at})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{occurrence}");
+        }
+        // March 28 is skipped. The April 30 collapse records only the latest
+        // scheduled due (April 28); the missed March period remains a gap.
+        let (status, collapsed) = http_json(
+            &state,
+            Method::POST,
+            &format!("/tasks/{gapped_id}/complete"),
+            Some(json!({"at": "2026-04-30T12:00:00"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{collapsed}");
+        assert_eq!(collapsed["due_date"], "2026-04-28");
+        let (status, streak) = http_json(
+            &state,
+            Method::GET,
+            &format!("/tasks/{gapped_id}/streak?as_of=2026-04-30"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{streak}");
+        assert_eq!(streak["current"], 1);
+        assert_eq!(streak["best"], 2);
+    }
+
+    #[test]
+    fn hydra_generated_cli_mcp_and_typescript_include_both_settings() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: generated_cli::GeneratedCommand,
+        }
+        let cli = Cli::try_parse_from([
+            "litany",
+            "task-create",
+            "--name",
+            "synthetic",
+            "--due",
+            "2026-11-01",
+            "--recurrence",
+            "{\"kind\":\"daily\"}",
+            "--anchor",
+            "2026-11-01",
+            "--collapse",
+            "true",
+            "--advance",
+            "slide",
+            "--created-at",
+            "2026-10-01T00:00:00",
+        ])
+        .unwrap();
+        let params = cli.command.parameters_json();
+        assert_eq!(params["collapse"], true);
+        assert_eq!(params["advance"], "slide");
+
+        let update = generated_cli::GeneratedCommand::TaskUpdate(generated_cli::TaskUpdateArgs {
+            task_id: "1".into(),
+            name: "synthetic".into(),
+            due: Some("2026-11-01".into()),
+            recurrence: Some(json!({"kind": "daily"})),
+            anchor: "2026-11-01".into(),
+            collapse: Some(false),
+            advance: Some("anchor".into()),
+        })
+        .parameters_json();
+        assert_eq!(update["collapse"], false);
+        assert_eq!(update["advance"], "anchor");
+
+        let mcp: Value = serde_json::from_str(GENERATED_MCP_JSON).unwrap();
+        for operation in ["task_create", "task_update"] {
+            let locations = &mcp["locations"][operation];
+            assert_eq!(locations["collapse"], "body");
+            assert_eq!(locations["advance"], "body");
+            let tool = mcp["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == operation)
+                .unwrap();
+            let properties = &tool["inputSchema"]["properties"];
+            assert_eq!(properties["collapse"]["type"], "boolean");
+            assert_eq!(properties["advance"]["type"], "string");
+            assert!(!tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "collapse" || field == "advance"));
+        }
+
+        let typescript = include_str!("../../../generated/ts-client/index.ts");
+        assert!(typescript.contains("collapse?: boolean;"));
+        assert!(typescript.contains("advance?: string;"));
+        assert!(typescript.contains("\"collapse\": params.collapse"));
+        assert!(typescript.contains("\"advance\": params.advance"));
+    }
+
+    #[tokio::test]
+    async fn generated_mcp_locations_dispatch_configuration_through_shared_operation() {
+        let state = AppState::in_memory();
+        let mcp: Value = serde_json::from_str(GENERATED_MCP_JSON).unwrap();
+        let args = json!({
+            "name": "synthetic mcp task",
+            "due": "2026-11-01",
+            "recurrence": {"kind": "daily"},
+            "anchor": "2026-11-01",
+            "collapse": true,
+            "advance": "slide",
+            "created_at": "2026-10-01T00:00:00"
+        });
+        let mut body = serde_json::Map::new();
+        for (key, location) in mcp["locations"]["task_create"].as_object().unwrap() {
+            if location == "body" {
+                if let Some(value) = args.get(key) {
+                    body.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        let created = execute_operation(
+            &state,
+            "task_create",
+            generated::GeneratedOperationInput {
+                path: BTreeMap::new(),
+                query: BTreeMap::new(),
+                body: Value::Object(body),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(created["collapse"], true);
+        assert_eq!(created["advance"], "slide");
+
+        let update_args = json!({
+            "task_id": created["id"].as_i64().unwrap().to_string(),
+            "name": "updated synthetic mcp task",
+            "due": "2026-11-01",
+            "recurrence": {"kind": "daily"},
+            "anchor": "2026-11-01"
+        });
+        let mut path = BTreeMap::new();
+        let mut update_body = serde_json::Map::new();
+        for (key, location) in mcp["locations"]["task_update"].as_object().unwrap() {
+            let value = update_args.get(key).cloned().unwrap_or(Value::Null);
+            match location.as_str().unwrap() {
+                "path" => {
+                    path.insert(key.clone(), value.as_str().unwrap_or_default().to_owned());
+                }
+                "body" => {
+                    update_body.insert(key.clone(), value);
+                }
+                other => panic!("unexpected generated MCP parameter location: {other}"),
+            }
+        }
+        let updated = execute_operation(
+            &state,
+            "task_update",
+            generated::GeneratedOperationInput {
+                path,
+                query: BTreeMap::new(),
+                body: Value::Object(update_body),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated["collapse"], true);
+        assert_eq!(updated["advance"], "slide");
     }
 }
