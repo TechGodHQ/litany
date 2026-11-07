@@ -560,7 +560,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litany-codegen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "hydra-codegen",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "litany-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "litany-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "litany-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "litany-core",
