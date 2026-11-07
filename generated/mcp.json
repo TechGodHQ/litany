@@ -8,7 +8,9 @@
       "task_id": "path"
     },
     "task_create": {
+      "advance": "body",
       "anchor": "body",
+      "collapse": "body",
       "created_at": "body",
       "due": "body",
       "name": "body",
@@ -26,7 +28,9 @@
       "task_id": "path"
     },
     "task_update": {
+      "advance": "body",
       "anchor": "body",
+      "collapse": "body",
       "due": "body",
       "name": "body",
       "recurrence": "body",
@@ -42,9 +46,17 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "advance": {
+            "description": "Anchor or slide mode for collapsed completions; defaults to anchor.",
+            "type": "string"
+          },
           "anchor": {
             "description": "UTC anchor date (YYYY-MM-DD)",
             "type": "string"
+          },
+          "collapse": {
+            "description": "Collapse overdue scheduled dues into one completion; defaults to stacking behavior.",
+            "type": "boolean"
           },
           "created_at": {
             "description": "UTC creation timestamp (RFC3339 without offset)",
@@ -77,9 +89,17 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "advance": {
+            "description": "Replacement anchor or slide mode for collapsed completions; omitted updates preserve the current value.",
+            "type": "string"
+          },
           "anchor": {
             "description": "Replacement UTC anchor date",
             "type": "string"
+          },
+          "collapse": {
+            "description": "Replacement overdue-collapse setting; omitted updates preserve the current value.",
+            "type": "boolean"
           },
           "due": {
             "description": "Optional replacement UTC due date",
@@ -144,7 +164,7 @@
       "name": "task_list"
     },
     {
-      "description": "Record an occurrence against the task's current due date and advance recurrence atomically.",
+      "description": "Record one occurrence and advance recurrence atomically; overdue collapse attributes it to the latest scheduled due on or before the completion UTC date.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

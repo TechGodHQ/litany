@@ -4,10 +4,14 @@
 //! never reads a clock.
 
 use chrono::{NaiveDate, NaiveDateTime};
-use litany_core::{next_due, Occurrence, Recurrence, Task};
+use litany_core::{
+    most_recent_satisfied_due, next_due, next_due_for_mode, AdvanceMode, Occurrence, Recurrence,
+    Task,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 const SCHEMA_V0: &str = include_str!("schema.sql");
+const MIGRATION_V2: &str = include_str!("migration_v2.sql");
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -81,10 +85,10 @@ impl Store {
 
     /// Applies embedded migrations, tracked by SQLite's `user_version`.
     pub fn migrate(&mut self) -> Result<()> {
-        let version: u32 = self
+        let mut version: u32 = self
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err(StoreError::InvalidCompletion(
                 "database schema is newer than this store",
             ));
@@ -94,6 +98,13 @@ impl Store {
             tx.execute_batch(SCHEMA_V0)?;
             tx.pragma_update(None, "user_version", 1)?;
             tx.commit()?;
+            version = 1;
+        }
+        if version == 1 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(MIGRATION_V2)?;
+            tx.pragma_update(None, "user_version", 2)?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -102,8 +113,8 @@ impl Store {
         validate_task(task)?;
         let tx = self.connection.transaction()?;
         tx.execute(
-            "INSERT INTO tasks (name, due, recurrence_json, anchor, created_at, archived) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![task.name, date_text(task.due), recurrence_text(task.recurrence.as_ref())?, task.anchor.to_string(), timestamp_text(task.created_at), task.archived],
+            "INSERT INTO tasks (name, due, recurrence_json, anchor, collapse, advance_mode, created_at, archived) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![task.name, date_text(task.due), recurrence_text(task.recurrence.as_ref())?, task.anchor.to_string(), task.collapse, advance_text(task.advance), timestamp_text(task.created_at), task.archived],
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
@@ -114,8 +125,8 @@ impl Store {
     pub fn update_task(&mut self, task: &Task) -> Result<()> {
         validate_task(task)?;
         let changed = self.connection.execute(
-            "UPDATE tasks SET name=?1, due=?2, recurrence_json=?3, anchor=?4, created_at=?5, archived=?6 WHERE id=?7",
-            params![task.name, date_text(task.due), recurrence_text(task.recurrence.as_ref())?, task.anchor.to_string(), timestamp_text(task.created_at), task.archived, task.id],
+            "UPDATE tasks SET name=?1, due=?2, recurrence_json=?3, anchor=?4, collapse=?5, advance_mode=?6, created_at=?7, archived=?8 WHERE id=?9",
+            params![task.name, date_text(task.due), recurrence_text(task.recurrence.as_ref())?, task.anchor.to_string(), task.collapse, advance_text(task.advance), timestamp_text(task.created_at), task.archived, task.id],
         )?;
         if changed == 0 {
             return Err(StoreError::InvalidCompletion("task does not exist"));
@@ -135,9 +146,9 @@ impl Store {
 
     pub fn list_tasks(&self, due_before: Option<NaiveDate>) -> Result<Vec<Task>> {
         let mut statement = if due_before.is_some() {
-            self.connection.prepare("SELECT id, name, due, recurrence_json, anchor, created_at, archived FROM tasks WHERE archived=0 AND due <= ?1 ORDER BY due, id")?
+            self.connection.prepare("SELECT id, name, due, recurrence_json, anchor, collapse, advance_mode, created_at, archived FROM tasks WHERE archived=0 AND due <= ?1 ORDER BY due, id")?
         } else {
-            self.connection.prepare("SELECT id, name, due, recurrence_json, anchor, created_at, archived FROM tasks WHERE archived=0 ORDER BY due IS NULL, due, id")?
+            self.connection.prepare("SELECT id, name, due, recurrence_json, anchor, collapse, advance_mode, created_at, archived FROM tasks WHERE archived=0 ORDER BY due IS NULL, due, id")?
         };
         let mut rows = match due_before {
             Some(date) => statement.query([date.to_string()])?,
@@ -157,8 +168,10 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Records a completion and advances a recurring task from the satisfied
-    /// due date, not wall-clock completion time, in the same transaction.
+    /// Records a completion and advances a recurring task atomically. In
+    /// collapse mode, a late completion is attributed to the most recent
+    /// scheduled due on or before its UTC date; missed periods are not
+    /// materialized. Early completions retain the legacy one-step behavior.
     /// For no-due tasks, callers attribute the occurrence to the UTC date of
     /// `completed_at`; such tasks cannot carry a recurrence.
     pub fn record_occurrence(
@@ -191,14 +204,47 @@ impl Store {
             }
             _ => {}
         }
+
+        let (recorded_due, next) = if let Some(rule) = task.recurrence.as_ref() {
+            let current_due = task.due.ok_or(StoreError::InvalidCompletion(
+                "recurring task requires a due date",
+            ))?;
+            if task.collapse && completed_at.date() >= current_due {
+                let recorded_due = most_recent_satisfied_due(
+                    rule,
+                    current_due,
+                    task.anchor,
+                    completed_at.date(),
+                    task.advance,
+                );
+                let advance_from = match task.advance {
+                    AdvanceMode::Anchor => recorded_due,
+                    AdvanceMode::Slide => completed_at.date(),
+                };
+                let next = next_due_for_mode(rule, advance_from, task.anchor, task.advance)
+                    .ok_or(StoreError::UnrepresentableNextDue)?;
+                (recorded_due, Some(next))
+            } else {
+                // Stacking (and early completion) always preserves the legacy
+                // single-step advance, independent of the configured mode.
+                let next = next_due(rule, current_due, task.anchor)
+                    .ok_or(StoreError::UnrepresentableNextDue)?;
+                (current_due, Some(next))
+            }
+        } else {
+            (due_date, None)
+        };
+
         tx.execute(
             "INSERT INTO occurrences (task_id, due_date, completed_at) VALUES (?1, ?2, ?3)",
-            params![task_id, due_date.to_string(), timestamp_text(completed_at)],
+            params![
+                task_id,
+                recorded_due.to_string(),
+                timestamp_text(completed_at)
+            ],
         )?;
         let id = tx.last_insert_rowid();
-        if let Some(rule) = task.recurrence.as_ref() {
-            let next =
-                next_due(rule, due_date, task.anchor).ok_or(StoreError::UnrepresentableNextDue)?;
+        if let Some(next) = next {
             tx.execute(
                 "UPDATE tasks SET due=?1 WHERE id=?2",
                 params![next.to_string(), task_id],
@@ -208,7 +254,7 @@ impl Store {
         Ok(Occurrence {
             id,
             task_id,
-            due_date,
+            due_date: recorded_due,
             completed_at,
         })
     }
@@ -241,6 +287,24 @@ fn date_text(date: Option<NaiveDate>) -> Option<String> {
 fn timestamp_text(timestamp: NaiveDateTime) -> String {
     timestamp.format("%Y-%m-%dT%H:%M:%S%.f").to_string()
 }
+fn advance_text(advance: AdvanceMode) -> &'static str {
+    match advance {
+        AdvanceMode::Anchor => "anchor",
+        AdvanceMode::Slide => "slide",
+    }
+}
+
+fn advance_from_text(value: String) -> rusqlite::Result<AdvanceMode> {
+    match value.as_str() {
+        "anchor" => Ok(AdvanceMode::Anchor),
+        "slide" => Ok(AdvanceMode::Slide),
+        _ => Err(conversion_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid recurrence advance mode",
+        ))),
+    }
+}
+
 fn recurrence_text(recurrence: Option<&Recurrence>) -> Result<Option<String>> {
     recurrence
         .map(serde_json::to_string)
@@ -251,7 +315,7 @@ fn recurrence_text(recurrence: Option<&Recurrence>) -> Result<Option<String>> {
 fn task_in_connection(connection: &Connection, id: i64) -> Result<Option<Task>> {
     connection
         .query_row(
-            "SELECT id, name, due, recurrence_json, anchor, created_at, archived FROM tasks WHERE id=?1",
+            "SELECT id, name, due, recurrence_json, anchor, collapse, advance_mode, created_at, archived FROM tasks WHERE id=?1",
             [id],
             task_from_row,
         )
@@ -262,7 +326,7 @@ fn task_in_connection(connection: &Connection, id: i64) -> Result<Option<Task>> 
 fn task_in_transaction(transaction: &Transaction<'_>, id: i64) -> Result<Option<Task>> {
     transaction
         .query_row(
-            "SELECT id, name, due, recurrence_json, anchor, created_at, archived FROM tasks WHERE id=?1",
+            "SELECT id, name, due, recurrence_json, anchor, collapse, advance_mode, created_at, archived FROM tasks WHERE id=?1",
             [id],
             task_from_row,
         )
@@ -290,11 +354,13 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
             .get::<_, String>(4)?
             .parse::<NaiveDate>()
             .map_err(conversion_error)?,
+        collapse: row.get(5)?,
+        advance: advance_from_text(row.get(6)?)?,
         created_at: row
-            .get::<_, String>(5)?
+            .get::<_, String>(7)?
             .parse::<NaiveDateTime>()
             .map_err(conversion_error)?,
-        archived: row.get(6)?,
+        archived: row.get(8)?,
     })
 }
 
@@ -332,6 +398,8 @@ mod tests {
             due,
             recurrence,
             anchor: date(2026, 1, 31),
+            collapse: false,
+            advance: AdvanceMode::Anchor,
             created_at: time(2026, 1, 1),
             archived: false,
         }
@@ -419,5 +487,185 @@ mod tests {
             [],
         );
         assert!(matches!(result, Err(rusqlite::Error::SqliteFailure(_, _))));
+    }
+
+    #[test]
+    fn collapse_records_only_the_latest_satisfied_daily_due() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut input = task(Some(date(2026, 11, 1)), Some(Recurrence::Daily));
+        input.anchor = date(2026, 11, 1);
+        input.collapse = true;
+        let created = store.create_task(&input).unwrap();
+        let completed_at = date(2026, 11, 5).and_hms_opt(23, 59, 12).unwrap();
+
+        let occurrence = store
+            .record_occurrence(created.id, date(2026, 11, 1), completed_at)
+            .unwrap();
+        assert_eq!(occurrence.due_date, date(2026, 11, 5));
+        assert_eq!(occurrence.completed_at, completed_at);
+        let history = store.occurrences_for_task(created.id).unwrap();
+        assert_eq!(history.len(), 1, "missed dates must not be backfilled");
+        assert_eq!(history[0].due_date, date(2026, 11, 5));
+        let stored = store.get_task(created.id).unwrap().unwrap();
+        assert_eq!(stored.due, Some(date(2026, 11, 6)));
+        assert!(stored.collapse);
+        assert_eq!(stored.advance, AdvanceMode::Anchor);
+    }
+
+    #[test]
+    fn slide_month_collapse_uses_completion_day_and_persists_across_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("litany.db");
+        let mut input = task(
+            Some(date(2026, 1, 31)),
+            Some(Recurrence::Monthly { day: Some(31) }),
+        );
+        input.collapse = true;
+        input.advance = AdvanceMode::Slide;
+        let created = {
+            let mut store = Store::open(&database).unwrap();
+            let created = store.create_task(&input).unwrap();
+            let completed_at = date(2026, 4, 30).and_hms_opt(7, 8, 9).unwrap();
+            let occurrence = store
+                .record_occurrence(created.id, date(2026, 1, 31), completed_at)
+                .unwrap();
+            assert_eq!(occurrence.due_date, date(2026, 4, 28));
+            created
+        };
+
+        let reopened = Store::open(&database).unwrap();
+        let stored = reopened.get_task(created.id).unwrap().unwrap();
+        assert_eq!(stored.due, Some(date(2026, 5, 30)));
+        assert!(stored.collapse);
+        assert_eq!(stored.advance, AdvanceMode::Slide);
+        let history = reopened.occurrences_for_task(created.id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].due_date, date(2026, 4, 28));
+        assert_eq!(
+            history[0].completed_at,
+            date(2026, 4, 30).and_hms_opt(7, 8, 9).unwrap()
+        );
+    }
+
+    #[test]
+    fn advance_mode_does_not_enable_collapse_and_early_completion_consumes_one_step() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut stacking = task(Some(date(2026, 11, 1)), Some(Recurrence::Daily));
+        stacking.anchor = date(2026, 11, 1);
+        stacking.advance = AdvanceMode::Slide;
+        let created = store.create_task(&stacking).unwrap();
+        let occurrence = store
+            .record_occurrence(
+                created.id,
+                date(2026, 11, 1),
+                date(2026, 11, 5).and_hms_opt(12, 0, 0).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(occurrence.due_date, date(2026, 11, 1));
+        assert_eq!(
+            store.get_task(created.id).unwrap().unwrap().due,
+            Some(date(2026, 11, 2))
+        );
+
+        let mut early = task(Some(date(2026, 11, 1)), Some(Recurrence::Daily));
+        early.anchor = date(2026, 11, 1);
+        early.collapse = true;
+        early.advance = AdvanceMode::Slide;
+        let early = store.create_task(&early).unwrap();
+        let occurrence = store
+            .record_occurrence(
+                early.id,
+                date(2026, 11, 1),
+                date(2026, 10, 31).and_hms_opt(12, 0, 0).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(occurrence.due_date, date(2026, 11, 1));
+        assert_eq!(
+            store.get_task(early.id).unwrap().unwrap().due,
+            Some(date(2026, 11, 2))
+        );
+
+        let mut monthly = task(
+            Some(date(2026, 1, 31)),
+            Some(Recurrence::Monthly { day: Some(31) }),
+        );
+        monthly.anchor = date(2026, 1, 31);
+        monthly.collapse = true;
+        monthly.advance = AdvanceMode::Slide;
+        let monthly = store.create_task(&monthly).unwrap();
+        let occurrence = store
+            .record_occurrence(
+                monthly.id,
+                date(2026, 1, 31),
+                date(2026, 1, 15).and_hms_opt(12, 0, 0).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(occurrence.due_date, date(2026, 1, 31));
+        assert_eq!(
+            store.get_task(monthly.id).unwrap().unwrap().due,
+            Some(date(2026, 2, 28)),
+            "early completion preserves the legacy step from the outstanding due"
+        );
+    }
+
+    #[test]
+    fn completion_uses_utc_date_boundary_for_overdue_and_on_time_collapses() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut input = task(Some(date(2026, 11, 1)), Some(Recurrence::Daily));
+        input.anchor = date(2026, 11, 1);
+        input.collapse = true;
+        let created = store.create_task(&input).unwrap();
+
+        let before_midnight = date(2026, 11, 4).and_hms_opt(23, 59, 59).unwrap();
+        let first = store
+            .record_occurrence(created.id, date(2026, 11, 1), before_midnight)
+            .unwrap();
+        assert_eq!(first.due_date, date(2026, 11, 4));
+        assert_eq!(first.completed_at, before_midnight);
+
+        let after_midnight = date(2026, 11, 5).and_hms_opt(0, 0, 1).unwrap();
+        let second = store
+            .record_occurrence(created.id, date(2026, 11, 5), after_midnight)
+            .unwrap();
+        assert_eq!(second.due_date, date(2026, 11, 5));
+        assert_eq!(second.completed_at, after_midnight);
+        assert_eq!(
+            store
+                .occurrences_for_task(created.id)
+                .unwrap()
+                .iter()
+                .map(|row| row.due_date)
+                .collect::<Vec<_>>(),
+            vec![date(2026, 11, 4), date(2026, 11, 5)]
+        );
+    }
+
+    #[test]
+    fn migration_v2_preserves_legacy_rows_with_stacking_anchor_defaults() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA_V0).unwrap();
+        connection.execute(
+            "INSERT INTO tasks (id, name, due, recurrence_json, anchor, created_at, archived) VALUES (7, 'legacy', '2026-11-01', '{\"kind\":\"daily\"}', '2026-11-01', '2026-10-01T00:00:00', 0)",
+            [],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO occurrences (task_id, due_date, completed_at) VALUES (7, '2026-10-31', '2026-10-31T12:00:00')",
+            [],
+        ).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        let mut store = Store { connection };
+
+        store.migrate().unwrap();
+        let version: u32 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let legacy = store.get_task(7).unwrap().unwrap();
+        assert!(!legacy.collapse);
+        assert_eq!(legacy.advance, AdvanceMode::Anchor);
+        let history = store.occurrences_for_task(7).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].due_date, date(2026, 10, 31));
     }
 }

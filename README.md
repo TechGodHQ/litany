@@ -48,6 +48,31 @@ The owner-approved contract for schedule changes, occurrence history, streak int
   Streaks and history are **derived** from occurrences; nothing stores a
   mutable counter that can drift from reality.
 
+## Completion modes
+
+Recurring tasks have independent `collapse` and `advance` settings. Omitted
+settings and migrated legacy rows default to `collapse: false` and
+`advance: "anchor"`, preserving one outstanding due per completion and the
+existing anchored advancement. `advance` is meaningful only when collapse is
+enabled; it never enables collapse by itself. Replacement updates that omit
+these fields retain their stored values.
+
+With collapse enabled, a late completion records exactly one occurrence at
+the latest scheduled due on or before the completion's UTC date. Intervening
+missed periods remain absent and break strict streak continuity; the real
+completion timestamp is retained. An early completion records the outstanding
+due and advances only one step. `anchor` selects the next slot on the existing
+calendar schedule. `slide` starts one full recurrence interval from the
+completion date (including full weeks and month-end-clamped months).
+
+Streaks remain strict: collapse never backfills missed periods or repairs gaps.
+For the task's current settings, slide-collapse streaks follow completion-relative
+intervals; stacking, anchor collapse, and early completions retain anchored
+single-step continuity. Setting history is not stored per occurrence, so
+`current` and `best` evaluate history under the task's current recurrence and
+settings rather than reconstructing schedule segments or prior configurations;
+historical schedule context remains limited as described by COD-547.
+
 ## Dogfood consumer
 
 Litany is consumed over iris (Telegram) the way hermes-comms is: "done",

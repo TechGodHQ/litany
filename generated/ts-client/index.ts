@@ -53,6 +53,8 @@ export interface TaskCreateParams {
   due?: string;
   recurrence?: { [key: string]: unknown };
   anchor: string;
+  collapse?: boolean;
+  advance?: string;
   created_at: string;
 }
 
@@ -66,6 +68,8 @@ export interface TaskUpdateParams {
   due?: string;
   recurrence?: { [key: string]: unknown };
   anchor: string;
+  collapse?: boolean;
+  advance?: string;
 }
 
 /** Result type declared as `Task`. */
@@ -88,7 +92,7 @@ export interface TaskListParams {
 /** Result type declared as `Vec<Task>`. */
 export type TaskListResult = Array<Task>;
 
-/** Record an occurrence against the task's current due date and advance recurrence atomically. */
+/** Record one occurrence and advance recurrence atomically; overdue collapse attributes it to the latest scheduled due on or before the completion UTC date. */
 export interface TaskCompleteParams {
   task_id: string;
   at: string;
@@ -144,6 +148,8 @@ export class LitanyClient {
         "due": params.due,
         "recurrence": params.recurrence,
         "anchor": params.anchor,
+        "collapse": params.collapse,
+        "advance": params.advance,
         "created_at": params.created_at,
       }),
     });
@@ -159,6 +165,8 @@ export class LitanyClient {
         "due": params.due,
         "recurrence": params.recurrence,
         "anchor": params.anchor,
+        "collapse": params.collapse,
+        "advance": params.advance,
       }),
     });
   }
@@ -185,7 +193,7 @@ export class LitanyClient {
     });
   }
 
-  /** Record an occurrence against the task's current due date and advance recurrence atomically. */
+  /** Record one occurrence and advance recurrence atomically; overdue collapse attributes it to the latest scheduled due on or before the completion UTC date. */
   async taskComplete(params: TaskCompleteParams): Promise<TaskCompleteResult> {
     const url = this.makeUrl("/tasks/" + encodeURIComponent(String(params.task_id)) + "/complete");
     return this.request(url, {

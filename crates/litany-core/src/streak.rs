@@ -5,11 +5,11 @@
 //! satisfies its scheduled period while `completed_at` remains the truthful
 //! record of when the work happened.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
 
-use crate::{next_due, Occurrence, Recurrence};
+use crate::{next_due, next_due_for_mode, AdvanceMode, Occurrence, Recurrence};
 
 /// Return the number of consecutively completed periods ending at `as_of`.
 ///
@@ -32,8 +32,31 @@ pub fn current(
     anchor: NaiveDate,
     as_of: NaiveDate,
 ) -> usize {
+    current_with_settings(
+        occurrences,
+        rule,
+        initial_due,
+        anchor,
+        as_of,
+        false,
+        AdvanceMode::Anchor,
+    )
+}
+
+/// Current streak using the task's current collapse and advance settings.
+/// Historical setting changes are not reconstructed; the supplied settings
+/// are applied to the available occurrence history.
+pub fn current_with_settings(
+    occurrences: &[Occurrence],
+    rule: &Recurrence,
+    initial_due: NaiveDate,
+    anchor: NaiveDate,
+    as_of: NaiveDate,
+    collapse: bool,
+    advance: AdvanceMode,
+) -> usize {
     let completed = completion_dates(occurrences, initial_due, Some(as_of));
-    let Some(&last_due) = completed.last() else {
+    let Some((&last_due, &last_completed_at)) = completed.last_key_value() else {
         return 0;
     };
 
@@ -42,13 +65,16 @@ pub fn current(
     // without a completion. At the representable-date boundary, a missing
     // following boundary leaves the known current period open rather than
     // inventing an expiry.
-    let expires_at = next_due(rule, last_due, anchor)
-        .and_then(|open_period| next_due(rule, open_period, anchor));
+    let open_period =
+        next_due_after_occurrence(rule, last_due, last_completed_at, anchor, collapse, advance);
+    let expires_at = open_period.and_then(|open_period| {
+        next_due_after_open_period(rule, open_period, anchor, collapse, advance)
+    });
     if expires_at.is_some_and(|boundary| as_of >= boundary) {
         return 0;
     }
 
-    consecutive_run_ending_at(&completed, rule, anchor)
+    consecutive_run_ending_at(&completed, rule, anchor, collapse, advance)
 }
 
 /// Return the largest run of consecutively completed recurrence periods.
@@ -61,18 +87,49 @@ pub fn best(
     initial_due: NaiveDate,
     anchor: NaiveDate,
 ) -> usize {
+    best_with_settings(
+        occurrences,
+        rule,
+        initial_due,
+        anchor,
+        false,
+        AdvanceMode::Anchor,
+    )
+}
+
+/// Best streak using the task's current collapse and advance settings.
+/// Historical setting changes are not reconstructed; the supplied settings
+/// are applied to the available occurrence history.
+pub fn best_with_settings(
+    occurrences: &[Occurrence],
+    rule: &Recurrence,
+    initial_due: NaiveDate,
+    anchor: NaiveDate,
+    collapse: bool,
+    advance: AdvanceMode,
+) -> usize {
     let completed = completion_dates(occurrences, initial_due, None);
     let mut best = 0;
     let mut run = 0;
     let mut previous = None;
-    for due in completed {
-        run = if previous.is_some_and(|prior| next_due(rule, prior, anchor) == Some(due)) {
-            run + 1
-        } else {
-            1
+    for (&due, &completed_at) in &completed {
+        run = match previous {
+            Some((prior_due, prior_completed_at))
+                if next_due_after_occurrence(
+                    rule,
+                    prior_due,
+                    prior_completed_at,
+                    anchor,
+                    collapse,
+                    advance,
+                ) == Some(due) =>
+            {
+                run + 1
+            }
+            _ => 1,
         };
         best = best.max(run);
-        previous = Some(due);
+        previous = Some((due, completed_at));
     }
     best
 }
@@ -81,33 +138,78 @@ fn completion_dates(
     occurrences: &[Occurrence],
     initial_due: NaiveDate,
     as_of: Option<NaiveDate>,
-) -> BTreeSet<NaiveDate> {
-    occurrences
-        .iter()
-        .map(|occurrence| occurrence.due_date)
-        .filter(|due| *due >= initial_due && as_of.is_none_or(|date| *due <= date))
-        .collect()
+) -> BTreeMap<NaiveDate, chrono::NaiveDateTime> {
+    let mut completed = BTreeMap::new();
+    for occurrence in occurrences {
+        let due = occurrence.due_date;
+        if due < initial_due || as_of.is_some_and(|date| due > date) {
+            continue;
+        }
+        completed
+            .entry(due)
+            .and_modify(|completed_at: &mut chrono::NaiveDateTime| {
+                *completed_at = (*completed_at).max(occurrence.completed_at);
+            })
+            .or_insert(occurrence.completed_at);
+    }
+    completed
 }
 
 fn consecutive_run_ending_at(
-    completed: &BTreeSet<NaiveDate>,
+    completed: &BTreeMap<NaiveDate, chrono::NaiveDateTime>,
     rule: &Recurrence,
     anchor: NaiveDate,
+    collapse: bool,
+    advance: AdvanceMode,
 ) -> usize {
-    let Some(&last_due) = completed.last() else {
+    let mut completed = completed.iter().rev();
+    let Some((&last_due, _)) = completed.next() else {
         return 0;
     };
 
     let mut run = 1;
     let mut later = last_due;
-    for earlier in completed.range(..last_due).rev() {
-        if next_due(rule, *earlier, anchor) != Some(later) {
+    for (&earlier, &completed_at) in completed {
+        if next_due_after_occurrence(rule, earlier, completed_at, anchor, collapse, advance)
+            != Some(later)
+        {
             break;
         }
         run += 1;
-        later = *earlier;
+        later = earlier;
     }
     run
+}
+
+fn next_due_after_occurrence(
+    rule: &Recurrence,
+    due: NaiveDate,
+    completed_at: chrono::NaiveDateTime,
+    anchor: NaiveDate,
+    collapse: bool,
+    advance: AdvanceMode,
+) -> Option<NaiveDate> {
+    if collapse && advance == AdvanceMode::Slide && completed_at.date() >= due {
+        next_due_for_mode(rule, completed_at.date(), anchor, AdvanceMode::Slide)
+    } else {
+        // Stacking and early completion retain the legacy one-step anchored
+        // advancement, even when the task is configured for slide collapse.
+        next_due(rule, due, anchor)
+    }
+}
+
+fn next_due_after_open_period(
+    rule: &Recurrence,
+    open_period: NaiveDate,
+    anchor: NaiveDate,
+    collapse: bool,
+    advance: AdvanceMode,
+) -> Option<NaiveDate> {
+    if collapse && advance == AdvanceMode::Slide {
+        next_due_for_mode(rule, open_period, anchor, AdvanceMode::Slide)
+    } else {
+        next_due(rule, open_period, anchor)
+    }
 }
 
 #[cfg(test)]
@@ -347,5 +449,99 @@ mod tests {
         assert_eq!(best(&[], &rule, initial_due, anchor), 0);
         let before = [occurrence(date(2026, 8, 31), date(2026, 8, 31))];
         assert_eq!(best(&before, &rule, initial_due, anchor), 0);
+    }
+
+    #[test]
+    fn slide_streaks_follow_completion_relative_months_and_preserve_real_gaps() {
+        let anchor = date(2026, 1, 31);
+        let rule = Recurrence::Monthly { day: Some(31) };
+        let continuous = [
+            occurrence(anchor, anchor),
+            occurrence(date(2026, 2, 28), date(2026, 2, 28)),
+            occurrence(date(2026, 3, 28), date(2026, 3, 28)),
+        ];
+
+        assert_eq!(
+            current_with_settings(
+                &continuous,
+                &rule,
+                anchor,
+                anchor,
+                date(2026, 4, 29),
+                true,
+                AdvanceMode::Slide,
+            ),
+            3
+        );
+        assert_eq!(
+            best_with_settings(&continuous, &rule, anchor, anchor, true, AdvanceMode::Slide,),
+            3
+        );
+        assert_eq!(
+            current_with_settings(
+                &continuous,
+                &rule,
+                anchor,
+                anchor,
+                date(2026, 5, 28),
+                true,
+                AdvanceMode::Slide,
+            ),
+            0,
+            "an uncompleted open slide period expires at its next boundary"
+        );
+
+        // March 28 was missed; collapsing at the end of April records only
+        // April 28 and must not reconnect the March-to-April streak.
+        let with_gap = [
+            continuous[0].clone(),
+            continuous[1].clone(),
+            occurrence(date(2026, 4, 28), date(2026, 4, 30)),
+        ];
+        assert_eq!(
+            current_with_settings(
+                &with_gap,
+                &rule,
+                anchor,
+                anchor,
+                date(2026, 4, 30),
+                true,
+                AdvanceMode::Slide,
+            ),
+            1
+        );
+        assert_eq!(
+            best_with_settings(&with_gap, &rule, anchor, anchor, true, AdvanceMode::Slide,),
+            2
+        );
+    }
+
+    #[test]
+    fn early_slide_completion_keeps_legacy_single_step_streak_boundary() {
+        let due = date(2026, 11, 1);
+        let occurrences = [occurrence(due, date(2026, 10, 31))];
+        assert_eq!(
+            current_with_settings(
+                &occurrences,
+                &Recurrence::Daily,
+                due,
+                due,
+                due,
+                true,
+                AdvanceMode::Slide,
+            ),
+            1
+        );
+        assert_eq!(
+            best_with_settings(
+                &occurrences,
+                &Recurrence::Daily,
+                due,
+                due,
+                true,
+                AdvanceMode::Slide,
+            ),
+            1
+        );
     }
 }
