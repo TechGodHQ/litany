@@ -115,7 +115,9 @@ pub fn next_due_for_mode(
 
 /// Find the most recent scheduled due on or before `completed_on`, beginning
 /// with the task's outstanding due. If completion is early, the outstanding
-/// due is returned unchanged and no future period is consumed.
+/// due is returned unchanged and no future period is consumed. Fixed intervals
+/// use arithmetic; sliding monthly clamping inspects at most one Gregorian cycle
+/// per candidate (at most two candidates, 9600 month-length probes), never a number of steps proportional to elapsed time.
 pub fn most_recent_satisfied_due(
     rule: &Recurrence,
     outstanding_due: NaiveDate,
@@ -127,14 +129,76 @@ pub fn most_recent_satisfied_due(
         return outstanding_due;
     }
 
-    let mut latest = outstanding_due;
-    while let Some(next) = next_due_for_mode(rule, latest, anchor, mode) {
-        if next > completed_on {
-            break;
-        }
-        latest = next;
+    // Validate once and preserve the legacy no-next/early-completion behavior.
+    let Some(first) = next_due_for_mode(rule, outstanding_due, anchor, mode) else {
+        return outstanding_due;
+    };
+    if first > completed_on {
+        return outstanding_due;
     }
-    latest
+
+    use Recurrence::*;
+    let month_interval = match rule {
+        Monthly { .. } => 1,
+        EveryNMonths { n } => *n,
+        _ => {
+            // An anchored weekly rule may have a short first step to align
+            // its weekday. All subsequent steps are exactly seven days.
+            let days = match rule {
+                Daily => 1,
+                EveryNDays { n } | FromLast { days: n } => i64::from(*n),
+                Weekly { .. } => 7,
+                EveryNWeeks { n } => i64::from(*n) * 7,
+                _ => unreachable!(),
+            };
+            let elapsed = (completed_on - first).num_days();
+            return first
+                .checked_add_signed(chrono::Duration::days(elapsed / days * days))
+                .expect("fast-forward stays between first due and completion");
+        }
+    };
+
+    let start_month = i64::from(outstanding_due.year()) * 12 + i64::from(outstanding_due.month0());
+    let end_month = i64::from(completed_on.year()) * 12 + i64::from(completed_on.month0());
+    let interval = i64::from(month_interval);
+    let steps = (end_month - start_month) / interval;
+    let scheduled = |steps: i64| {
+        if steps == 0 {
+            return outstanding_due;
+        }
+        let month = start_month + steps * interval;
+        let year = month.div_euclid(12) as i32;
+        let month_of_year = (month.rem_euclid(12) + 1) as u32;
+        let mut day = match (rule, mode) {
+            (_, AdvanceMode::Slide) => outstanding_due.day(),
+            (Monthly { day }, _) => day.unwrap_or(anchor.day()),
+            _ => anchor.day(),
+        };
+        if mode == AdvanceMode::Slide && day > 28 {
+            // Slide clamping is cumulative, not just a clamp in the final
+            // month. Gregorian month lengths repeat every 400 years (4800
+            // months); any fixed-month progression repeats within 4800
+            // steps. Scan at most one cycle, independent of elapsed time.
+            for step in 1..=steps.min(4800) {
+                let visited = start_month + step * interval;
+                let y = visited.div_euclid(12) as i32;
+                let m = (visited.rem_euclid(12) + 1) as u32;
+                day = day.min(days_in_month_opt(y, m).unwrap());
+                if day == 28 {
+                    break;
+                }
+            }
+        }
+        let last = days_in_month_opt(year, month_of_year).unwrap();
+        NaiveDate::from_ymd_opt(year, month_of_year, day.min(last))
+            .expect("candidate month is between outstanding due and completion")
+    };
+    let candidate = scheduled(steps);
+    if candidate > completed_on {
+        scheduled(steps - 1)
+    } else {
+        candidate
+    }
 }
 
 /// First date strictly after `from` whose day-of-month is `d` (clamped to
@@ -701,5 +765,115 @@ mod tests {
             ),
             Some(d(2024, 3, 29))
         );
+    }
+
+    #[test]
+    fn collapse_wide_date_range_has_bounded_work() {
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let min = NaiveDate::MIN;
+            let max = NaiveDate::MAX;
+            for mode in [AdvanceMode::Anchor, AdvanceMode::Slide] {
+                assert_eq!(
+                    most_recent_satisfied_due(&Recurrence::Daily, min, min, max, mode),
+                    max
+                );
+                for rule in [
+                    Recurrence::Monthly { day: Some(31) },
+                    Recurrence::EveryNMonths { n: 13 },
+                ] {
+                    let latest = most_recent_satisfied_due(&rule, min, min, max, mode);
+                    assert!(latest <= max);
+                    assert!(next_due_for_mode(&rule, latest, min, mode).is_none());
+                }
+            }
+            send.send(()).unwrap();
+        });
+        recv.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("collapse must not traverse all elapsed periods across valid dates");
+    }
+
+    #[test]
+    fn collapse_matches_iterative_schedule_oracle() {
+        let mut rules = vec![
+            Recurrence::Daily,
+            Recurrence::Weekly { weekday: None },
+            Recurrence::Weekly { weekday: Some(0) },
+            Recurrence::Weekly { weekday: Some(7) },
+            Recurrence::Monthly { day: None },
+            Recurrence::Monthly { day: Some(0) },
+        ];
+        for n in [0, 1, 2, 7, 13, 48, 400, u32::MAX] {
+            rules.extend([
+                Recurrence::EveryNDays { n },
+                Recurrence::EveryNWeeks { n },
+                Recurrence::EveryNMonths { n },
+                Recurrence::FromLast { days: n },
+            ]);
+        }
+        for day in [1, 28, 29, 30, 31, 32] {
+            rules.push(Recurrence::Monthly { day: Some(day) });
+        }
+        for start in [
+            d(-401, 1, 31),
+            d(-1, 2, 28),
+            d(2024, 1, 31),
+            d(2096, 2, 29),
+            d(2026, 9, 23),
+            NaiveDate::MIN,
+            d(NaiveDate::MAX.year() - 2, 1, 31),
+        ] {
+            for anchor in [start, d(2000, 1, 29), d(2001, 8, 31)] {
+                for offset in [-1, 0, 1, 7, 28, 29, 30, 31, 59, 366, 1600] {
+                    let Some(end) = start.checked_add_signed(chrono::Duration::days(offset)) else {
+                        continue;
+                    };
+                    for rule in &rules {
+                        for mode in [AdvanceMode::Anchor, AdvanceMode::Slide] {
+                            let mut expected = start;
+                            while let Some(next) = next_due_for_mode(rule, expected, anchor, mode) {
+                                if next > end {
+                                    break;
+                                }
+                                expected = next;
+                            }
+                            assert_eq!(
+                                most_recent_satisfied_due(rule, start, anchor, end, mode),
+                                expected,
+                                "{rule:?} {mode:?} start={start} anchor={anchor} end={end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapse_monthly_matches_oracle_beyond_gregorian_cycle() {
+        for start in [d(-401, 1, 31), d(2000, 2, 29), d(2096, 2, 29)] {
+            for n in [1, 2, 3, 12, 13, 48, 97, 400, 4800, 4801] {
+                for mode in [AdvanceMode::Anchor, AdvanceMode::Slide] {
+                    for end_day in [1, 28, 31] {
+                        // Stride 97 is coprime to 4800; exceed the full scan cap.
+                        let years = if n == 97 { 40_001 } else { 801 };
+                        let end = d(start.year() + years, 1, end_day);
+                        let rule = Recurrence::EveryNMonths { n };
+                        let mut expected = start;
+                        while let Some(next) = next_due_for_mode(&rule, expected, start, mode) {
+                            if next > end {
+                                break;
+                            }
+                            expected = next;
+                        }
+                        assert_eq!(
+                            most_recent_satisfied_due(&rule, start, start, end, mode),
+                            expected,
+                            "n={n}, {mode:?}, start={start}, end={end}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
