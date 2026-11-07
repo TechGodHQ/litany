@@ -20,6 +20,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -39,12 +42,12 @@ jobs:
             type=ref,event=tag
             type=raw,value=latest
 
-      - name: Build and push amd64 image
+      - name: Build and push multi-arch image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
