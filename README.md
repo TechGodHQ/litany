@@ -35,6 +35,10 @@ outputs are byte-deterministic. Generation only maintains the contract. It does
 not start local HTTP/MCP surfaces, deploy the Litany service, publish an npm
 package, or configure an Iris provider.
 
+## Schedule context and edits
+
+The owner-approved contract for schedule changes, occurrence history, streak interpretation, legacy limits, and future implementation slices is in [docs/schedule-context.md](docs/schedule-context.md).
+
 ## Model
 
 - `Task` — name, optional due date, optional recurrence (`daily`,
