@@ -1,6 +1,6 @@
 [package]
 name = "litany-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Domain core for litany: tasks, recurrence rules, occurrences, streaks."
