@@ -39,6 +39,8 @@ package, or configure an Iris provider.
 
 The owner-approved contract for schedule changes, occurrence history, streak interpretation, legacy limits, and future implementation slices is in [docs/schedule-context.md](docs/schedule-context.md).
 
+The prospective flexible-period-target contract and its separately gated future slices are in [docs/flexible-targets.md](docs/flexible-targets.md). This is a design specification; flexible targets are not implemented.
+
 ## Model
 
 - `Task` — name, optional due date, optional recurrence (`daily`,
