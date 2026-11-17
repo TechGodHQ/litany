@@ -68,7 +68,7 @@ operations:
     parameters:
       - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
   - name: task_list
-    description: List active tasks with explicit optional filters.
+    description: List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list.
     method: GET
     path: /tasks
     read: true
@@ -76,6 +76,7 @@ operations:
     parameters:
       - { name: due_before, description: Include only tasks due on or before this UTC date, type: string, required: false, location: query }
       - { name: recurring, description: Include only recurring or non-recurring tasks, type: bool, required: false, location: query }
+      - { name: satisfied, description: One-off filter true|false|all; omitted/all preserve the current list, type: string, required: false, location: query }
   - name: task_complete
     description: Record one occurrence and advance recurrence atomically; overdue collapse attributes it to the latest scheduled due on or before the completion UTC date.
     method: POST
@@ -86,7 +87,7 @@ operations:
       - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
       - { name: at, description: UTC completion timestamp (RFC3339 without offset), type: string, required: true, location: body }
   - name: tasks_due
-    description: List active tasks due on or before an explicit UTC date.
+    description: List active tasks due on or before an explicit UTC date, excluding satisfied dated non-recurring tasks whose current due matches an occurrence.
     method: GET
     path: /tasks/due
     read: true

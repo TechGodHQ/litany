@@ -12,6 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 const SCHEMA_V0: &str = include_str!("schema.sql");
 const MIGRATION_V2: &str = include_str!("migration_v2.sql");
+const SATISFIED_ONE_OFF_SQL: &str = "(tasks.recurrence_json IS NULL AND tasks.due IS NOT NULL AND EXISTS (SELECT 1 FROM occurrences WHERE occurrences.task_id = tasks.id AND occurrences.due_date = tasks.due))";
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -57,6 +58,17 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 pub struct Store {
     connection: Connection,
+}
+
+/// Selects active tasks by their occurrence-backed one-off satisfaction state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SatisfactionFilter {
+    /// Preserve the existing list behavior, regardless of satisfaction.
+    All,
+    /// Include only satisfied, dated, non-recurring tasks.
+    Satisfied,
+    /// Exclude satisfied, dated, non-recurring tasks; keep recurring and null-due tasks.
+    Unsatisfied,
 }
 
 impl Store {
@@ -145,11 +157,36 @@ impl Store {
     }
 
     pub fn list_tasks(&self, due_before: Option<NaiveDate>) -> Result<Vec<Task>> {
-        let mut statement = if due_before.is_some() {
-            self.connection.prepare("SELECT id, name, due, recurrence_json, anchor, collapse, advance_mode, created_at, archived FROM tasks WHERE archived=0 AND due <= ?1 ORDER BY due, id")?
+        self.list_tasks_with_satisfaction(due_before, SatisfactionFilter::All)
+    }
+
+    /// Lists active tasks with optional due-date and occurrence-backed satisfaction filters.
+    /// Satisfaction is defined only for non-recurring tasks whose current due matches an
+    /// occurrence; completion timestamps do not alter this projection.
+    pub fn list_tasks_with_satisfaction(
+        &self,
+        due_before: Option<NaiveDate>,
+        satisfaction: SatisfactionFilter,
+    ) -> Result<Vec<Task>> {
+        let due_clause = if due_before.is_some() {
+            " AND tasks.due <= ?1"
         } else {
-            self.connection.prepare("SELECT id, name, due, recurrence_json, anchor, collapse, advance_mode, created_at, archived FROM tasks WHERE archived=0 ORDER BY due IS NULL, due, id")?
+            ""
         };
+        let satisfaction_clause = match satisfaction {
+            SatisfactionFilter::All => String::new(),
+            SatisfactionFilter::Satisfied => format!(" AND {SATISFIED_ONE_OFF_SQL}"),
+            SatisfactionFilter::Unsatisfied => format!(" AND NOT {SATISFIED_ONE_OFF_SQL}"),
+        };
+        let ordering = if due_before.is_some() {
+            "tasks.due, tasks.id"
+        } else {
+            "tasks.due IS NULL, tasks.due, tasks.id"
+        };
+        let query = format!(
+            "SELECT tasks.id, tasks.name, tasks.due, tasks.recurrence_json, tasks.anchor, tasks.collapse, tasks.advance_mode, tasks.created_at, tasks.archived FROM tasks WHERE tasks.archived=0{due_clause}{satisfaction_clause} ORDER BY {ordering}"
+        );
+        let mut statement = self.connection.prepare(&query)?;
         let mut rows = match due_before {
             Some(date) => statement.query([date.to_string()])?,
             None => statement.query([])?,
@@ -637,6 +674,187 @@ mod tests {
                 .map(|row| row.due_date)
                 .collect::<Vec<_>>(),
             vec![date(2026, 11, 4), date(2026, 11, 5)]
+        );
+    }
+
+    #[test]
+    fn satisfaction_filters_use_exact_current_due_occurrences_without_hiding_recurring_tasks() {
+        let mut store = Store::open_in_memory().unwrap();
+        let satisfied = store
+            .create_task(&task(Some(date(2026, 11, 1)), None))
+            .unwrap();
+        store
+            .record_occurrence(satisfied.id, date(2026, 11, 1), time(2026, 11, 10))
+            .unwrap();
+
+        let same_date_different_task = store
+            .create_task(&task(Some(date(2026, 11, 1)), None))
+            .unwrap();
+        let unsatisfied = store
+            .create_task(&task(Some(date(2026, 11, 2)), None))
+            .unwrap();
+
+        let changed_due = store
+            .create_task(&task(Some(date(2026, 11, 3)), None))
+            .unwrap();
+        store
+            .record_occurrence(changed_due.id, date(2026, 11, 3), time(2026, 11, 3))
+            .unwrap();
+        let mut changed_due_task = store.get_task(changed_due.id).unwrap().unwrap();
+        changed_due_task.due = Some(date(2026, 11, 4));
+        store.update_task(&changed_due_task).unwrap();
+
+        let wrong_occurrence_date = store
+            .create_task(&task(Some(date(2026, 11, 5)), None))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO occurrences (task_id, due_date, completed_at) VALUES (?1, ?2, ?3)",
+                params![
+                    wrong_occurrence_date.id,
+                    date(2026, 11, 4).to_string(),
+                    timestamp_text(time(2026, 11, 5))
+                ],
+            )
+            .unwrap();
+
+        let duplicate_history = store
+            .create_task(&task(Some(date(2026, 11, 6)), None))
+            .unwrap();
+        store
+            .record_occurrence(duplicate_history.id, date(2026, 11, 6), time(2026, 11, 6))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO occurrences (task_id, due_date, completed_at) VALUES (?1, ?2, ?3)",
+                params![
+                    duplicate_history.id,
+                    date(2026, 11, 6).to_string(),
+                    timestamp_text(time(2026, 11, 7))
+                ],
+            )
+            .unwrap();
+
+        let recurring = store
+            .create_task(&task(Some(date(2026, 11, 7)), Some(Recurrence::Daily)))
+            .unwrap();
+        store
+            .record_occurrence(recurring.id, date(2026, 11, 7), time(2026, 11, 7))
+            .unwrap();
+        assert_eq!(
+            store.get_task(recurring.id).unwrap().unwrap().due,
+            Some(date(2026, 11, 8))
+        );
+
+        let inconsistent_recurring = store
+            .create_task(&task(Some(date(2026, 11, 9)), Some(Recurrence::Daily)))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO occurrences (task_id, due_date, completed_at) VALUES (?1, ?2, ?3)",
+                params![
+                    inconsistent_recurring.id,
+                    date(2026, 11, 9).to_string(),
+                    timestamp_text(time(2026, 11, 9))
+                ],
+            )
+            .unwrap();
+
+        let future_satisfied = store
+            .create_task(&task(Some(date(2026, 11, 11)), None))
+            .unwrap();
+        store
+            .record_occurrence(future_satisfied.id, date(2026, 11, 11), time(2026, 11, 9))
+            .unwrap();
+
+        let null_due = store.create_task(&task(None, None)).unwrap();
+        let archived = store
+            .create_task(&task(Some(date(2026, 11, 12)), None))
+            .unwrap();
+        store.archive_task(archived.id).unwrap();
+
+        let all = store.list_tasks(None).unwrap();
+        let all_ids = all.iter().map(|task| task.id).collect::<Vec<_>>();
+        assert_eq!(
+            all_ids,
+            vec![
+                satisfied.id,
+                same_date_different_task.id,
+                unsatisfied.id,
+                changed_due.id,
+                wrong_occurrence_date.id,
+                duplicate_history.id,
+                recurring.id,
+                inconsistent_recurring.id,
+                future_satisfied.id,
+                null_due.id,
+            ]
+        );
+
+        let satisfied_ids = store
+            .list_tasks_with_satisfaction(None, SatisfactionFilter::Satisfied)
+            .unwrap()
+            .iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            satisfied_ids,
+            vec![satisfied.id, duplicate_history.id, future_satisfied.id]
+        );
+
+        let unsatisfied_ids = store
+            .list_tasks_with_satisfaction(None, SatisfactionFilter::Unsatisfied)
+            .unwrap()
+            .iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unsatisfied_ids,
+            vec![
+                same_date_different_task.id,
+                unsatisfied.id,
+                changed_due.id,
+                wrong_occurrence_date.id,
+                recurring.id,
+                inconsistent_recurring.id,
+                null_due.id,
+            ]
+        );
+
+        let due_as_of_november_3 = store
+            .list_tasks_with_satisfaction(Some(date(2026, 11, 3)), SatisfactionFilter::Unsatisfied)
+            .unwrap();
+        assert_eq!(
+            due_as_of_november_3
+                .iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec![same_date_different_task.id, unsatisfied.id]
+        );
+        assert!(due_as_of_november_3
+            .iter()
+            .all(|task| task.due.is_some_and(|due| due <= date(2026, 11, 3))));
+
+        assert_eq!(
+            store.occurrences_for_task(satisfied.id).unwrap().len(),
+            1,
+            "listing must not mutate completion history"
+        );
+        assert_eq!(
+            store
+                .occurrences_for_task(duplicate_history.id)
+                .unwrap()
+                .len(),
+            2,
+            "duplicate matching occurrence rows still produce one task row"
+        );
+        assert_eq!(
+            store.occurrences_for_task(recurring.id).unwrap()[0].due_date,
+            date(2026, 11, 7),
+            "recurring history remains unchanged"
         );
     }
 

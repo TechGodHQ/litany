@@ -21,7 +21,8 @@
     },
     "task_list": {
       "due_before": "query",
-      "recurring": "query"
+      "recurring": "query",
+      "satisfied": "query"
     },
     "task_streak": {
       "as_of": "query",
@@ -145,7 +146,7 @@
       "name": "task_archive"
     },
     {
-      "description": "List active tasks with explicit optional filters.",
+      "description": "List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -156,6 +157,10 @@
           "recurring": {
             "description": "Include only recurring or non-recurring tasks",
             "type": "boolean"
+          },
+          "satisfied": {
+            "description": "One-off filter true|false|all; omitted/all preserve the current list",
+            "type": "string"
           }
         },
         "required": [],
@@ -186,7 +191,7 @@
       "name": "task_complete"
     },
     {
-      "description": "List active tasks due on or before an explicit UTC date.",
+      "description": "List active tasks due on or before an explicit UTC date, excluding satisfied dated non-recurring tasks whose current due matches an occurrence.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

@@ -39,6 +39,12 @@ package, or configure an Iris provider.
 
 The owner-approved contract for schedule changes, occurrence history, streak interpretation, legacy limits, and future implementation slices is in [docs/schedule-context.md](docs/schedule-context.md).
 
+## One-off satisfaction projections
+
+A dated non-recurring task is satisfied when its occurrence history contains the same task ID and the task's current due date. `GET /tasks/due?as_of=YYYY-MM-DD` omits only those satisfied one-off tasks whose due is on or before `as_of`; it does not use `completed_at` as a time-travel cutoff. Future dues remain outside the due projection, and recurring tasks remain visible even if an inconsistent occurrence matches their current due. Null-due and archived task behavior is unchanged.
+
+`GET /tasks` accepts the optional `satisfied` query filter: `true` selects satisfied one-off tasks, `false` excludes them while retaining recurring and null-due tasks, and `all` (the default when omitted) preserves the existing list. Other values are rejected. The filter composes with `due_before` and `recurring`; occurrence history remains the completion truth and streaks remain derived.
+
 ## Model
 
 - `Task` — name, optional due date, optional recurrence (`daily`,

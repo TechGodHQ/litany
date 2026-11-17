@@ -83,10 +83,11 @@ export interface TaskArchiveParams {
 /** Result type declared as `Task`. */
 export type TaskArchiveResult = Task;
 
-/** List active tasks with explicit optional filters. */
+/** List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list. */
 export interface TaskListParams {
   due_before?: string;
   recurring?: boolean;
+  satisfied?: string;
 }
 
 /** Result type declared as `Vec<Task>`. */
@@ -101,7 +102,7 @@ export interface TaskCompleteParams {
 /** Result type declared as `Occurrence`. */
 export type TaskCompleteResult = Occurrence;
 
-/** List active tasks due on or before an explicit UTC date. */
+/** List active tasks due on or before an explicit UTC date, excluding satisfied dated non-recurring tasks whose current due matches an occurrence. */
 export interface TasksDueParams {
   as_of: string;
 }
@@ -179,7 +180,7 @@ export class LitanyClient {
     });
   }
 
-  /** List active tasks with explicit optional filters. */
+  /** List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list. */
   async taskList(params: TaskListParams = {}): Promise<TaskListResult> {
     const url = this.makeUrl("/tasks");
     if (params.due_before !== undefined) {
@@ -187,6 +188,9 @@ export class LitanyClient {
     }
     if (params.recurring !== undefined) {
       url.searchParams.set("recurring", String(params.recurring));
+    }
+    if (params.satisfied !== undefined) {
+      url.searchParams.set("satisfied", String(params.satisfied));
     }
     return this.request(url, {
       method: "GET",
@@ -204,7 +208,7 @@ export class LitanyClient {
     });
   }
 
-  /** List active tasks due on or before an explicit UTC date. */
+  /** List active tasks due on or before an explicit UTC date, excluding satisfied dated non-recurring tasks whose current due matches an occurrence. */
   async tasksDue(params: TasksDueParams): Promise<TasksDueResult> {
     const url = this.makeUrl("/tasks/due");
     if (params.as_of !== undefined) {

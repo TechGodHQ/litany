@@ -12,11 +12,11 @@ pub enum GeneratedCommand {
     TaskUpdate(TaskUpdateArgs),
     /// Archive a task without deleting its occurrence history.
     TaskArchive(TaskArchiveArgs),
-    /// List active tasks with explicit optional filters.
+    /// List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list.
     TaskList(TaskListArgs),
     /// Record one occurrence and advance recurrence atomically; overdue collapse attributes it to the latest scheduled due on or before the completion UTC date.
     TaskComplete(TaskCompleteArgs),
-    /// List active tasks due on or before an explicit UTC date.
+    /// List active tasks due on or before an explicit UTC date, excluding satisfied dated non-recurring tasks whose current due matches an occurrence.
     TasksDue(TasksDueArgs),
     /// Return occurrence history for one task.
     TaskHistory(TaskHistoryArgs),
@@ -43,7 +43,7 @@ impl GeneratedCommand {
             Self::TaskCreate(args) => serde_json::json!({"name": args.name.clone(), "due": args.due.clone(), "recurrence": args.recurrence.clone(), "anchor": args.anchor.clone(), "collapse": args.collapse.clone(), "advance": args.advance.clone(), "created_at": args.created_at.clone()}),
             Self::TaskUpdate(args) => serde_json::json!({"task_id": args.task_id.clone(), "name": args.name.clone(), "due": args.due.clone(), "recurrence": args.recurrence.clone(), "anchor": args.anchor.clone(), "collapse": args.collapse.clone(), "advance": args.advance.clone()}),
             Self::TaskArchive(args) => serde_json::json!({"task_id": args.task_id.clone()}),
-            Self::TaskList(args) => serde_json::json!({"due_before": args.due_before.clone(), "recurring": args.recurring.clone()}),
+            Self::TaskList(args) => serde_json::json!({"due_before": args.due_before.clone(), "recurring": args.recurring.clone(), "satisfied": args.satisfied.clone()}),
             Self::TaskComplete(args) => serde_json::json!({"task_id": args.task_id.clone(), "at": args.at.clone()}),
             Self::TasksDue(args) => serde_json::json!({"as_of": args.as_of.clone()}),
             Self::TaskHistory(args) => serde_json::json!({"task_id": args.task_id.clone()}),
@@ -115,6 +115,9 @@ pub struct TaskListArgs {
     /// Include only recurring or non-recurring tasks
     #[arg(long)]
     pub recurring: Option<bool>,
+    /// One-off filter true|false|all; omitted/all preserve the current list
+    #[arg(long)]
+    pub satisfied: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]
