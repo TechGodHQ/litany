@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use axum::{http::StatusCode, response::IntoResponse, Router};
 use chrono::{NaiveDate, NaiveDateTime};
 use litany_core::{streak, AdvanceMode, Recurrence, Task};
-use litany_store::Store;
+use litany_store::{SatisfactionFilter, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -189,8 +189,14 @@ pub async fn execute_operation(
                         .map_err(|_| bad("recurring must be true or false"))
                 })
                 .transpose()?;
+            let satisfaction = match query(&input, "satisfied").unwrap_or("all") {
+                "true" => SatisfactionFilter::Satisfied,
+                "false" => SatisfactionFilter::Unsatisfied,
+                "all" => SatisfactionFilter::All,
+                _ => return Err(bad("satisfied must be true, false, or all")),
+            };
             let tasks = store
-                .list_tasks(due_before)
+                .list_tasks_with_satisfaction(due_before, satisfaction)
                 .map_err(store_error)?
                 .into_iter()
                 .filter(|task| recurring.is_none_or(|wanted| task.recurrence.is_some() == wanted))
@@ -199,7 +205,11 @@ pub async fn execute_operation(
         }
         "tasks_due" => {
             let as_of = date(query(&input, "as_of").ok_or_else(|| bad("missing as_of"))?)?;
-            value(store.list_tasks(Some(as_of)).map_err(store_error)?)
+            value(
+                store
+                    .list_tasks_with_satisfaction(Some(as_of), SatisfactionFilter::Unsatisfied)
+                    .map_err(store_error)?,
+            )
         }
         "task_complete" => {
             let id = path_i64(&input, "task_id")?;
@@ -553,6 +563,263 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generated_http_satisfaction_filters_preserve_due_history_and_streak_semantics() {
+        use axum::http::Method;
+
+        let state = AppState::in_memory();
+        let (status, completed_one_off) = http_json(
+            &state,
+            Method::POST,
+            "/tasks",
+            Some(json!({
+                "name": "synthetic satisfied one-off",
+                "due": "2026-11-01",
+                "anchor": "2026-11-01",
+                "created_at": "2026-10-01T00:00:00"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{completed_one_off}");
+        let completed_id = completed_one_off["id"].as_i64().unwrap();
+
+        let (status, due_before_completion) =
+            http_json(&state, Method::GET, "/tasks/due?as_of=2026-11-01", None).await;
+        assert_eq!(status, StatusCode::OK, "{due_before_completion}");
+        assert!(due_before_completion
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == completed_id));
+
+        let (status, completion) = http_json(
+            &state,
+            Method::POST,
+            &format!("/tasks/{completed_id}/complete"),
+            Some(json!({"at": "2026-11-01T12:00:00"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{completion}");
+
+        let (status, due_after_completion) =
+            http_json(&state, Method::GET, "/tasks/due?as_of=2026-11-01", None).await;
+        assert_eq!(status, StatusCode::OK, "{due_after_completion}");
+        assert!(!due_after_completion
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == completed_id));
+
+        let (status, unsatisfied_one_off) = http_json(
+            &state,
+            Method::POST,
+            "/tasks",
+            Some(json!({
+                "name": "synthetic unsatisfied one-off",
+                "due": "2026-11-02",
+                "anchor": "2026-11-02",
+                "created_at": "2026-10-01T00:00:00"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{unsatisfied_one_off}");
+        let unsatisfied_id = unsatisfied_one_off["id"].as_i64().unwrap();
+
+        let (status, future_one_off) = http_json(
+            &state,
+            Method::POST,
+            "/tasks",
+            Some(json!({
+                "name": "synthetic future one-off",
+                "due": "2026-11-03",
+                "anchor": "2026-11-03",
+                "created_at": "2026-10-01T00:00:00"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{future_one_off}");
+        let future_id = future_one_off["id"].as_i64().unwrap();
+        let (status, future_completion) = http_json(
+            &state,
+            Method::POST,
+            &format!("/tasks/{future_id}/complete"),
+            Some(json!({"at": "2026-11-01T13:00:00"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{future_completion}");
+
+        let (status, recurring) = http_json(
+            &state,
+            Method::POST,
+            "/tasks",
+            Some(json!({
+                "name": "synthetic recurring",
+                "due": "2026-11-01",
+                "recurrence": {"kind": "daily"},
+                "anchor": "2026-11-01",
+                "created_at": "2026-10-01T00:00:00"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{recurring}");
+        let recurring_id = recurring["id"].as_i64().unwrap();
+        let (status, recurring_completion) = http_json(
+            &state,
+            Method::POST,
+            &format!("/tasks/{recurring_id}/complete"),
+            Some(json!({"at": "2026-11-01T14:00:00"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{recurring_completion}");
+        assert_eq!(recurring_completion["due_date"], "2026-11-01");
+
+        let (status, null_due) = http_json(
+            &state,
+            Method::POST,
+            "/tasks",
+            Some(json!({
+                "name": "synthetic no-due task",
+                "anchor": "2026-11-01",
+                "created_at": "2026-10-01T00:00:00"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{null_due}");
+        let null_due_id = null_due["id"].as_i64().unwrap();
+
+        let (status, due_as_of_november_2) =
+            http_json(&state, Method::GET, "/tasks/due?as_of=2026-11-02", None).await;
+        assert_eq!(status, StatusCode::OK, "{due_as_of_november_2}");
+        let due_ids = due_as_of_november_2
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!due_ids.contains(&completed_id));
+        assert!(
+            !due_ids.contains(&future_id),
+            "future dues stay outside as_of"
+        );
+        assert!(due_ids.contains(&unsatisfied_id));
+        assert!(due_ids.contains(&recurring_id));
+        assert!(!due_ids.contains(&null_due_id));
+
+        let (status, due_as_of_future_due) =
+            http_json(&state, Method::GET, "/tasks/due?as_of=2026-11-03", None).await;
+        assert_eq!(status, StatusCode::OK, "{due_as_of_future_due}");
+        assert!(!due_as_of_future_due
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == future_id));
+
+        let (status, all_default) = http_json(&state, Method::GET, "/tasks", None).await;
+        assert_eq!(status, StatusCode::OK, "{all_default}");
+        let (status, all_explicit) =
+            http_json(&state, Method::GET, "/tasks?satisfied=all", None).await;
+        assert_eq!(status, StatusCode::OK, "{all_explicit}");
+        assert_eq!(all_explicit, all_default);
+
+        let (status, satisfied) =
+            http_json(&state, Method::GET, "/tasks?satisfied=true", None).await;
+        assert_eq!(status, StatusCode::OK, "{satisfied}");
+        let satisfied_ids = satisfied
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(satisfied_ids.contains(&completed_id));
+        assert!(satisfied_ids.contains(&future_id));
+        assert!(!satisfied_ids.contains(&recurring_id));
+        assert!(!satisfied_ids.contains(&null_due_id));
+
+        let (status, unsatisfied) =
+            http_json(&state, Method::GET, "/tasks?satisfied=false", None).await;
+        assert_eq!(status, StatusCode::OK, "{unsatisfied}");
+        let unsatisfied_ids = unsatisfied
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!unsatisfied_ids.contains(&completed_id));
+        assert!(!unsatisfied_ids.contains(&future_id));
+        assert!(unsatisfied_ids.contains(&unsatisfied_id));
+        assert!(unsatisfied_ids.contains(&recurring_id));
+        assert!(unsatisfied_ids.contains(&null_due_id));
+
+        let (status, composed) = http_json(
+            &state,
+            Method::GET,
+            "/tasks?due_before=2026-11-02&recurring=true&satisfied=false",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{composed}");
+        assert_eq!(
+            composed
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![recurring_id]
+        );
+
+        let (status, invalid) = http_json(&state, Method::GET, "/tasks?satisfied=yes", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid["error"], "satisfied must be true, false, or all");
+
+        let (status, history_before_filters) = http_json(
+            &state,
+            Method::GET,
+            &format!("/tasks/{recurring_id}/history"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{history_before_filters}");
+        let (status, streak_before_filters) = http_json(
+            &state,
+            Method::GET,
+            &format!("/tasks/{recurring_id}/streak?as_of=2026-11-02"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{streak_before_filters}");
+
+        for path in [
+            "/tasks",
+            "/tasks?satisfied=true",
+            "/tasks?satisfied=false",
+            "/tasks?satisfied=all",
+            "/tasks/due?as_of=2026-11-02",
+        ] {
+            let (status, _) = http_json(&state, Method::GET, path, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+        }
+
+        let (status, history_after_filters) = http_json(
+            &state,
+            Method::GET,
+            &format!("/tasks/{recurring_id}/history"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{history_after_filters}");
+        assert_eq!(history_after_filters, history_before_filters);
+        let (status, streak_after_filters) = http_json(
+            &state,
+            Method::GET,
+            &format!("/tasks/{recurring_id}/streak?as_of=2026-11-02"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{streak_after_filters}");
+        assert_eq!(streak_after_filters, streak_before_filters);
+    }
+
+    #[tokio::test]
     async fn generated_http_streaks_follow_slide_intervals_without_repairing_gaps() {
         use axum::http::Method;
 
@@ -651,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn hydra_generated_cli_mcp_and_typescript_include_both_settings() {
+    fn hydra_generated_cli_mcp_and_typescript_include_settings_and_satisfaction_filter() {
         use clap::Parser;
 
         #[derive(clap::Parser)]
@@ -716,11 +983,38 @@ mod tests {
                 .any(|field| field == "collapse" || field == "advance"));
         }
 
+        let cli_list = Cli::try_parse_from(["litany", "task-list", "--satisfied", "true"]).unwrap();
+        assert_eq!(cli_list.command.operation_name(), "task_list");
+        let list_params = cli_list.command.parameters_json();
+        assert_eq!(list_params["satisfied"], "true");
+
+        let list_locations = &mcp["locations"]["task_list"];
+        assert_eq!(list_locations["satisfied"], "query");
+        let list_tool = mcp["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "task_list")
+            .unwrap();
+        assert_eq!(
+            list_tool["inputSchema"]["properties"]["satisfied"]["type"],
+            "string"
+        );
+        assert!(!list_tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "satisfied"));
+
         let typescript = include_str!("../../../generated/ts-client/index.ts");
         assert!(typescript.contains("collapse?: boolean;"));
         assert!(typescript.contains("advance?: string;"));
         assert!(typescript.contains("\"collapse\": params.collapse"));
         assert!(typescript.contains("\"advance\": params.advance"));
+        assert!(typescript.contains("satisfied?: string;"));
+        assert!(
+            typescript.contains("url.searchParams.set(\"satisfied\", String(params.satisfied));")
+        );
     }
 
     #[tokio::test]
@@ -792,5 +1086,136 @@ mod tests {
         .unwrap();
         assert_eq!(updated["collapse"], true);
         assert_eq!(updated["advance"], "slide");
+    }
+
+    #[tokio::test]
+    async fn generated_cli_and_mcp_satisfaction_arguments_reach_shared_dispatch() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: generated_cli::GeneratedCommand,
+        }
+
+        fn query_from_generated_args(args: &Value, locations: &Value) -> BTreeMap<String, String> {
+            locations
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter_map(|(key, location)| {
+                    if location != "query" {
+                        return None;
+                    }
+                    let value = args.get(key)?;
+                    if value.is_null() {
+                        return None;
+                    }
+                    let value = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string().trim_matches('"').to_owned());
+                    Some((key.clone(), value))
+                })
+                .collect()
+        }
+
+        let state = AppState::in_memory();
+        let completed = execute_operation(
+            &state,
+            "task_create",
+            generated::GeneratedOperationInput {
+                path: BTreeMap::new(),
+                query: BTreeMap::new(),
+                body: json!({
+                    "name": "synthetic cli-mcp satisfied",
+                    "due": "2026-11-01",
+                    "anchor": "2026-11-01",
+                    "created_at": "2026-10-01T00:00:00"
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let completed_id = completed["id"].as_i64().unwrap();
+        let mut path = BTreeMap::new();
+        path.insert("task_id".into(), completed_id.to_string());
+        execute_operation(
+            &state,
+            "task_complete",
+            generated::GeneratedOperationInput {
+                path,
+                query: BTreeMap::new(),
+                body: json!({"at": "2026-11-01T12:00:00"}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let unsatisfied = execute_operation(
+            &state,
+            "task_create",
+            generated::GeneratedOperationInput {
+                path: BTreeMap::new(),
+                query: BTreeMap::new(),
+                body: json!({
+                    "name": "synthetic cli-mcp unsatisfied",
+                    "due": "2026-11-02",
+                    "anchor": "2026-11-02",
+                    "created_at": "2026-10-01T00:00:00"
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let unsatisfied_id = unsatisfied["id"].as_i64().unwrap();
+
+        let mcp: Value = serde_json::from_str(GENERATED_MCP_JSON).unwrap();
+        let cli = Cli::try_parse_from(["litany", "task-list", "--satisfied", "true"]).unwrap();
+        let cli_args = cli.command.parameters_json();
+        let cli_query = query_from_generated_args(&cli_args, &mcp["locations"]["task_list"]);
+        let cli_result = execute_operation(
+            &state,
+            "task_list",
+            generated::GeneratedOperationInput {
+                path: BTreeMap::new(),
+                query: cli_query,
+                body: Value::Null,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cli_result
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![completed_id]
+        );
+
+        let mcp_args = json!({"satisfied": "false"});
+        let mcp_query = query_from_generated_args(&mcp_args, &mcp["locations"]["task_list"]);
+        let mcp_result = execute_operation(
+            &state,
+            "task_list",
+            generated::GeneratedOperationInput {
+                path: BTreeMap::new(),
+                query: mcp_query,
+                body: Value::Null,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mcp_result
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![unsatisfied_id]
+        );
     }
 }
