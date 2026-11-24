@@ -67,8 +67,24 @@ operations:
     output_type: Task
     parameters:
       - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
+  - name: task_get
+    description: Read one task by stable ID, including archived tasks.
+    method: GET
+    path: /tasks/{task_id}
+    read: true
+    output_type: Task
+    parameters:
+      - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
+  - name: task_unarchive
+    description: Restore an archived task without changing its fields or occurrence history; active tasks are unchanged.
+    method: POST
+    path: /tasks/{task_id}/unarchive
+    read: false
+    output_type: Task
+    parameters:
+      - { name: task_id, description: Stable task ID, type: string, required: true, location: path }
   - name: task_list
-    description: List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list.
+    description: List tasks with explicit optional filters. Archived false is the default; q is a literal case-insensitive name substring. The optional satisfied filter selects one-off tasks only.
     method: GET
     path: /tasks
     read: true
@@ -77,6 +93,8 @@ operations:
       - { name: due_before, description: Include only tasks due on or before this UTC date, type: string, required: false, location: query }
       - { name: recurring, description: Include only recurring or non-recurring tasks, type: bool, required: false, location: query }
       - { name: satisfied, description: One-off filter true|false|all; omitted/all preserve the current list, type: string, required: false, location: query }
+      - { name: archived, description: Select false for active tasks by default; true for archived tasks; all for both, type: string, required: false, location: query }
+      - { name: q, description: Case-insensitive literal substring of the task name; empty is omitted, type: string, required: false, location: query }
   - name: task_complete
     description: Record one occurrence and advance recurrence atomically; overdue collapse attributes it to the latest scheduled due on or before the completion UTC date.
     method: POST

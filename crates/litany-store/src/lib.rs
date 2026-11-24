@@ -71,6 +71,17 @@ pub enum SatisfactionFilter {
     Unsatisfied,
 }
 
+/// Selects active tasks, archived tasks, or both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchivedFilter {
+    /// Preserve the existing active-task list behavior.
+    Active,
+    /// Include only archived tasks.
+    Archived,
+    /// Include active and archived tasks.
+    All,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let mut store = Self {
@@ -156,6 +167,20 @@ impl Store {
         Ok(())
     }
 
+    /// Unarchives a task without changing any other task field or occurrence.
+    /// Returns `None` only when the stable ID does not exist.
+    pub fn unarchive_task(&mut self, id: i64) -> Result<Option<Task>> {
+        let tx = self.connection.transaction()?;
+        if task_in_transaction(&tx, id)?.is_none() {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        tx.execute("UPDATE tasks SET archived=0 WHERE id=?1", [id])?;
+        let task = task_in_transaction(&tx, id)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
     pub fn list_tasks(&self, due_before: Option<NaiveDate>) -> Result<Vec<Task>> {
         self.list_tasks_with_satisfaction(due_before, SatisfactionFilter::All)
     }
@@ -168,6 +193,24 @@ impl Store {
         due_before: Option<NaiveDate>,
         satisfaction: SatisfactionFilter,
     ) -> Result<Vec<Task>> {
+        self.list_tasks_with_filters(due_before, satisfaction, ArchivedFilter::Active, None)
+    }
+
+    /// Lists tasks with due-date, satisfaction, archive, and literal name filters.
+    /// Name matching is Unicode-lowercased substring matching; SQL wildcard
+    /// characters such as `%` and `_` therefore remain literal.
+    pub fn list_tasks_with_filters(
+        &self,
+        due_before: Option<NaiveDate>,
+        satisfaction: SatisfactionFilter,
+        archived: ArchivedFilter,
+        name_query: Option<&str>,
+    ) -> Result<Vec<Task>> {
+        let archived_clause = match archived {
+            ArchivedFilter::Active => "tasks.archived=0",
+            ArchivedFilter::Archived => "tasks.archived=1",
+            ArchivedFilter::All => "1=1",
+        };
         let due_clause = if due_before.is_some() {
             " AND tasks.due <= ?1"
         } else {
@@ -184,7 +227,7 @@ impl Store {
             "tasks.due IS NULL, tasks.due, tasks.id"
         };
         let query = format!(
-            "SELECT tasks.id, tasks.name, tasks.due, tasks.recurrence_json, tasks.anchor, tasks.collapse, tasks.advance_mode, tasks.created_at, tasks.archived FROM tasks WHERE tasks.archived=0{due_clause}{satisfaction_clause} ORDER BY {ordering}"
+            "SELECT tasks.id, tasks.name, tasks.due, tasks.recurrence_json, tasks.anchor, tasks.collapse, tasks.advance_mode, tasks.created_at, tasks.archived FROM tasks WHERE {archived_clause}{due_clause}{satisfaction_clause} ORDER BY {ordering}"
         );
         let mut statement = self.connection.prepare(&query)?;
         let mut rows = match due_before {
@@ -194,6 +237,10 @@ impl Store {
         let mut tasks = Vec::new();
         while let Some(row) = rows.next()? {
             tasks.push(task_from_row(row)?);
+        }
+        if let Some(name_query) = name_query.filter(|query| !query.is_empty()) {
+            let name_query = name_query.to_lowercase();
+            tasks.retain(|task| task.name.to_lowercase().contains(&name_query));
         }
         Ok(tasks)
     }
@@ -514,6 +561,103 @@ mod tests {
             store.create_task(&task(None, Some(Recurrence::Daily))),
             Err(StoreError::InvalidCompletion(_))
         ));
+    }
+
+    #[test]
+    fn archive_filters_name_search_and_unarchive_preserve_task_and_history() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut matched_input = task(Some(date(2026, 11, 1)), None);
+        matched_input.name = "Routine 100%_Done".into();
+        let matched = store.create_task(&matched_input).unwrap();
+        store
+            .record_occurrence(matched.id, date(2026, 11, 1), time(2026, 11, 1))
+            .unwrap();
+        store.archive_task(matched.id).unwrap();
+
+        let mut active_input = task(Some(date(2026, 11, 2)), None);
+        active_input.name = "Routine 100xyDone".into();
+        let active = store.create_task(&active_input).unwrap();
+
+        let default = store.list_tasks(None).unwrap();
+        let default_ids = default.iter().map(|task| task.id).collect::<Vec<_>>();
+        assert_eq!(default_ids, vec![active.id]);
+        let explicit_active = store
+            .list_tasks_with_filters(None, SatisfactionFilter::All, ArchivedFilter::Active, None)
+            .unwrap();
+        assert_eq!(
+            explicit_active
+                .iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            default_ids
+        );
+
+        let archived = store
+            .list_tasks_with_filters(
+                None,
+                SatisfactionFilter::All,
+                ArchivedFilter::Archived,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            archived.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![matched.id]
+        );
+        let all = store
+            .list_tasks_with_filters(None, SatisfactionFilter::All, ArchivedFilter::All, None)
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![matched.id, active.id]
+        );
+
+        let literal = store
+            .list_tasks_with_filters(
+                None,
+                SatisfactionFilter::All,
+                ArchivedFilter::All,
+                Some("%_"),
+            )
+            .unwrap();
+        assert_eq!(
+            literal.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![matched.id]
+        );
+        let case_insensitive = store
+            .list_tasks_with_filters(
+                None,
+                SatisfactionFilter::All,
+                ArchivedFilter::All,
+                Some("rOuTiNe"),
+            )
+            .unwrap();
+        assert_eq!(case_insensitive.len(), 2);
+        assert!(case_insensitive
+            .iter()
+            .all(|task| task.name.to_lowercase().contains("routine")));
+
+        let history_before = store.occurrences_for_task(matched.id).unwrap();
+        let archived_task = store.get_task(matched.id).unwrap().unwrap();
+        assert!(archived_task.archived);
+        let first = store.unarchive_task(matched.id).unwrap().unwrap();
+        let second = store.unarchive_task(matched.id).unwrap().unwrap();
+        assert!(!first.archived);
+        assert_eq!(first.name, archived_task.name);
+        assert_eq!(first.due, archived_task.due);
+        assert_eq!(first.anchor, archived_task.anchor);
+        assert_eq!(first.recurrence, archived_task.recurrence);
+        assert_eq!(first.collapse, archived_task.collapse);
+        assert_eq!(first.advance, archived_task.advance);
+        assert_eq!(first.created_at, archived_task.created_at);
+        assert_eq!(second.name, first.name);
+        assert_eq!(second.due, first.due);
+        assert!(!second.archived);
+        assert_eq!(
+            serde_json::to_value(store.occurrences_for_task(matched.id).unwrap()).unwrap(),
+            serde_json::to_value(history_before).unwrap()
+        );
+        assert!(store.unarchive_task(i64::MAX).unwrap().is_none());
     }
 
     #[test]

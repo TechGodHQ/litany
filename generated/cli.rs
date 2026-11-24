@@ -12,7 +12,11 @@ pub enum GeneratedCommand {
     TaskUpdate(TaskUpdateArgs),
     /// Archive a task without deleting its occurrence history.
     TaskArchive(TaskArchiveArgs),
-    /// List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list.
+    /// Read one task by stable ID, including archived tasks.
+    TaskGet(TaskGetArgs),
+    /// Restore an archived task without changing its fields or occurrence history; active tasks are unchanged.
+    TaskUnarchive(TaskUnarchiveArgs),
+    /// List tasks with explicit optional filters. Archived false is the default; q is a literal case-insensitive name substring. The optional satisfied filter selects one-off tasks only.
     TaskList(TaskListArgs),
     /// Record one occurrence and advance recurrence atomically; overdue collapse attributes it to the latest scheduled due on or before the completion UTC date.
     TaskComplete(TaskCompleteArgs),
@@ -30,6 +34,8 @@ impl GeneratedCommand {
             Self::TaskCreate(_) => "task_create",
             Self::TaskUpdate(_) => "task_update",
             Self::TaskArchive(_) => "task_archive",
+            Self::TaskGet(_) => "task_get",
+            Self::TaskUnarchive(_) => "task_unarchive",
             Self::TaskList(_) => "task_list",
             Self::TaskComplete(_) => "task_complete",
             Self::TasksDue(_) => "tasks_due",
@@ -43,7 +49,9 @@ impl GeneratedCommand {
             Self::TaskCreate(args) => serde_json::json!({"name": args.name.clone(), "due": args.due.clone(), "recurrence": args.recurrence.clone(), "anchor": args.anchor.clone(), "collapse": args.collapse.clone(), "advance": args.advance.clone(), "created_at": args.created_at.clone()}),
             Self::TaskUpdate(args) => serde_json::json!({"task_id": args.task_id.clone(), "name": args.name.clone(), "due": args.due.clone(), "recurrence": args.recurrence.clone(), "anchor": args.anchor.clone(), "collapse": args.collapse.clone(), "advance": args.advance.clone()}),
             Self::TaskArchive(args) => serde_json::json!({"task_id": args.task_id.clone()}),
-            Self::TaskList(args) => serde_json::json!({"due_before": args.due_before.clone(), "recurring": args.recurring.clone(), "satisfied": args.satisfied.clone()}),
+            Self::TaskGet(args) => serde_json::json!({"task_id": args.task_id.clone()}),
+            Self::TaskUnarchive(args) => serde_json::json!({"task_id": args.task_id.clone()}),
+            Self::TaskList(args) => serde_json::json!({"due_before": args.due_before.clone(), "recurring": args.recurring.clone(), "satisfied": args.satisfied.clone(), "archived": args.archived.clone(), "q": args.q.clone()}),
             Self::TaskComplete(args) => serde_json::json!({"task_id": args.task_id.clone(), "at": args.at.clone()}),
             Self::TasksDue(args) => serde_json::json!({"as_of": args.as_of.clone()}),
             Self::TaskHistory(args) => serde_json::json!({"task_id": args.task_id.clone()}),
@@ -108,6 +116,18 @@ pub struct TaskArchiveArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]
+pub struct TaskGetArgs {
+    /// Stable task ID
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Args)]
+pub struct TaskUnarchiveArgs {
+    /// Stable task ID
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Args)]
 pub struct TaskListArgs {
     /// Include only tasks due on or before this UTC date
     #[arg(long)]
@@ -118,6 +138,12 @@ pub struct TaskListArgs {
     /// One-off filter true|false|all; omitted/all preserve the current list
     #[arg(long)]
     pub satisfied: Option<String>,
+    /// Select false for active tasks by default; true for archived tasks; all for both
+    #[arg(long)]
+    pub archived: Option<String>,
+    /// Case-insensitive literal substring of the task name; empty is omitted
+    #[arg(long)]
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]
