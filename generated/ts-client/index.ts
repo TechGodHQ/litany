@@ -83,11 +83,29 @@ export interface TaskArchiveParams {
 /** Result type declared as `Task`. */
 export type TaskArchiveResult = Task;
 
-/** List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list. */
+/** Read one task by stable ID, including archived tasks. */
+export interface TaskGetParams {
+  task_id: string;
+}
+
+/** Result type declared as `Task`. */
+export type TaskGetResult = Task;
+
+/** Restore an archived task without changing its fields or occurrence history; active tasks are unchanged. */
+export interface TaskUnarchiveParams {
+  task_id: string;
+}
+
+/** Result type declared as `Task`. */
+export type TaskUnarchiveResult = Task;
+
+/** List tasks with explicit optional filters. Archived false is the default; q is a literal case-insensitive name substring. The optional satisfied filter selects one-off tasks only. */
 export interface TaskListParams {
   due_before?: string;
   recurring?: boolean;
   satisfied?: string;
+  archived?: string;
+  q?: string;
 }
 
 /** Result type declared as `Vec<Task>`. */
@@ -180,7 +198,23 @@ export class LitanyClient {
     });
   }
 
-  /** List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list. */
+  /** Read one task by stable ID, including archived tasks. */
+  async taskGet(params: TaskGetParams): Promise<TaskGetResult> {
+    const url = this.makeUrl("/tasks/" + encodeURIComponent(String(params.task_id)));
+    return this.request(url, {
+      method: "GET",
+    });
+  }
+
+  /** Restore an archived task without changing its fields or occurrence history; active tasks are unchanged. */
+  async taskUnarchive(params: TaskUnarchiveParams): Promise<TaskUnarchiveResult> {
+    const url = this.makeUrl("/tasks/" + encodeURIComponent(String(params.task_id)) + "/unarchive");
+    return this.request(url, {
+      method: "POST",
+    });
+  }
+
+  /** List tasks with explicit optional filters. Archived false is the default; q is a literal case-insensitive name substring. The optional satisfied filter selects one-off tasks only. */
   async taskList(params: TaskListParams = {}): Promise<TaskListResult> {
     const url = this.makeUrl("/tasks");
     if (params.due_before !== undefined) {
@@ -191,6 +225,12 @@ export class LitanyClient {
     }
     if (params.satisfied !== undefined) {
       url.searchParams.set("satisfied", String(params.satisfied));
+    }
+    if (params.archived !== undefined) {
+      url.searchParams.set("archived", String(params.archived));
+    }
+    if (params.q !== undefined) {
+      url.searchParams.set("q", String(params.q));
     }
     return this.request(url, {
       method: "GET",

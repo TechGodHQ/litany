@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use axum::{http::StatusCode, response::IntoResponse, Router};
 use chrono::{NaiveDate, NaiveDateTime};
 use litany_core::{streak, AdvanceMode, Recurrence, Task};
-use litany_store::{SatisfactionFilter, Store};
+use litany_store::{ArchivedFilter, SatisfactionFilter, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -15,6 +15,7 @@ pub mod generated_cli {
     include!("../../../generated/cli.rs");
 }
 pub const GENERATED_MCP_JSON: &str = include_str!("../../../generated/mcp.json");
+pub const GENERATED_TS_CLIENT: &str = include_str!("../../../generated/ts-client/index.ts");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -77,6 +78,19 @@ fn path_i64(input: &generated::GeneratedOperationInput, key: &str) -> Result<i64
 }
 fn query<'a>(input: &'a generated::GeneratedOperationInput, key: &str) -> Option<&'a str> {
     input.query.get(key).map(String::as_str)
+}
+fn reject_unknown_query(
+    input: &generated::GeneratedOperationInput,
+    allowed: &[&str],
+) -> Result<(), OperationError> {
+    if let Some(key) = input
+        .query
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+    {
+        return Err(bad(format!("unknown query parameter: {key}")));
+    }
+    Ok(())
 }
 fn body<T: for<'a> Deserialize<'a>>(value: Value) -> Result<T, OperationError> {
     serde_json::from_value(value).map_err(|error| bad(format!("invalid request body: {error}")))
@@ -181,7 +195,29 @@ pub async fn execute_operation(
                     .ok_or_else(|| missing("task not found"))?,
             )
         }
+        "task_get" => {
+            let id = path_i64(&input, "task_id")?;
+            value(
+                store
+                    .get_task(id)
+                    .map_err(store_error)?
+                    .ok_or_else(|| missing("task not found"))?,
+            )
+        }
+        "task_unarchive" => {
+            let id = path_i64(&input, "task_id")?;
+            value(
+                store
+                    .unarchive_task(id)
+                    .map_err(store_error)?
+                    .ok_or_else(|| missing("task not found"))?,
+            )
+        }
         "task_list" => {
+            reject_unknown_query(
+                &input,
+                &["due_before", "recurring", "satisfied", "archived", "q"],
+            )?;
             let due_before = query(&input, "due_before").map(date).transpose()?;
             let recurring = query(&input, "recurring")
                 .map(|raw| {
@@ -195,8 +231,15 @@ pub async fn execute_operation(
                 "all" => SatisfactionFilter::All,
                 _ => return Err(bad("satisfied must be true, false, or all")),
             };
+            let archived = match query(&input, "archived").unwrap_or("false") {
+                "false" => ArchivedFilter::Active,
+                "true" => ArchivedFilter::Archived,
+                "all" => ArchivedFilter::All,
+                _ => return Err(bad("archived must be false, true, or all")),
+            };
+            let name_query = query(&input, "q").filter(|query| !query.is_empty());
             let tasks = store
-                .list_tasks_with_satisfaction(due_before, satisfaction)
+                .list_tasks_with_filters(due_before, satisfaction, archived, name_query)
                 .map_err(store_error)?
                 .into_iter()
                 .filter(|task| recurring.is_none_or(|wanted| task.recurrence.is_some() == wanted))
@@ -204,6 +247,7 @@ pub async fn execute_operation(
             value(tasks)
         }
         "tasks_due" => {
+            reject_unknown_query(&input, &["as_of"])?;
             let as_of = date(query(&input, "as_of").ok_or_else(|| bad("missing as_of"))?)?;
             value(
                 store
@@ -817,6 +861,409 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{streak_after_filters}");
         assert_eq!(streak_after_filters, streak_before_filters);
+    }
+
+    #[test]
+    fn generated_archive_recovery_contract_is_registered_on_all_surfaces() {
+        let expected_routes = [
+            ("task_get", "GET", "/tasks/{task_id}"),
+            ("task_unarchive", "POST", "/tasks/{task_id}/unarchive"),
+        ];
+        for (name, method, path) in expected_routes {
+            let route = generated::GENERATED_ROUTES
+                .iter()
+                .find(|route| route.name == name)
+                .unwrap();
+            assert_eq!((route.method, route.path), (method, path));
+        }
+
+        let get = generated_cli::GeneratedCommand::TaskGet(generated_cli::TaskGetArgs {
+            task_id: "17".into(),
+        });
+        assert_eq!(get.operation_name(), "task_get");
+        assert_eq!(get.parameters_json()["task_id"], "17");
+        let unarchive =
+            generated_cli::GeneratedCommand::TaskUnarchive(generated_cli::TaskUnarchiveArgs {
+                task_id: "17".into(),
+            });
+        assert_eq!(unarchive.operation_name(), "task_unarchive");
+        assert_eq!(unarchive.parameters_json()["task_id"], "17");
+        let list = generated_cli::GeneratedCommand::TaskList(generated_cli::TaskListArgs {
+            due_before: None,
+            recurring: None,
+            satisfied: None,
+            archived: Some("all".into()),
+            q: Some("literal_%".into()),
+        });
+        assert_eq!(list.parameters_json()["archived"], "all");
+        assert_eq!(list.parameters_json()["q"], "literal_%");
+
+        let manifest: Value = serde_json::from_str(GENERATED_MCP_JSON).unwrap();
+        assert_eq!(manifest["locations"]["task_get"]["task_id"], "path");
+        assert_eq!(manifest["locations"]["task_unarchive"]["task_id"], "path");
+        assert_eq!(manifest["locations"]["task_list"]["archived"], "query");
+        assert_eq!(manifest["locations"]["task_list"]["q"], "query");
+        let tools = manifest["tools"].as_array().unwrap();
+        let tool = |name: &str| tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool("task_get")["inputSchema"]["required"][0], "task_id");
+        assert_eq!(
+            tool("task_unarchive")["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1,
+            "unarchive takes only the stable task ID and no body"
+        );
+        assert_eq!(
+            tool("task_list")["inputSchema"]["properties"]["archived"]["type"],
+            "string"
+        );
+        assert_eq!(
+            tool("task_list")["inputSchema"]["properties"]["q"]["type"],
+            "string"
+        );
+
+        assert!(GENERATED_TS_CLIENT.contains("export interface TaskGetParams"));
+        assert!(GENERATED_TS_CLIENT.contains("async taskGet(params: TaskGetParams)"));
+        assert!(GENERATED_TS_CLIENT.contains("export interface TaskUnarchiveParams"));
+        assert!(GENERATED_TS_CLIENT.contains("async taskUnarchive(params: TaskUnarchiveParams)"));
+        assert!(GENERATED_TS_CLIENT.contains("archived?: string;"));
+        assert!(GENERATED_TS_CLIENT.contains("q?: string;"));
+    }
+
+    #[tokio::test]
+    async fn generated_http_archive_recovery_search_and_unarchive_are_exact() {
+        use axum::http::Method;
+        use std::collections::BTreeSet;
+
+        async fn create_task(
+            state: &AppState,
+            name: &str,
+            due: Option<&str>,
+            recurrence: Option<Value>,
+            collapse: bool,
+            advance: &str,
+        ) -> i64 {
+            let mut body = json!({
+                "name": name,
+                "anchor": "2026-11-01",
+                "collapse": collapse,
+                "advance": advance,
+                "created_at": "2026-10-01T00:00:00"
+            });
+            if let Some(due) = due {
+                body["due"] = json!(due);
+            }
+            if let Some(recurrence) = recurrence {
+                body["recurrence"] = recurrence;
+            }
+            let (status, created) = http_json(state, Method::POST, "/tasks", Some(body)).await;
+            assert_eq!(status, StatusCode::OK, "{created}");
+            created["id"].as_i64().unwrap()
+        }
+
+        let state = AppState::in_memory();
+        let dated = create_task(
+            &state,
+            "Routine 100%_Done",
+            Some("2026-11-01"),
+            None,
+            false,
+            "anchor",
+        )
+        .await;
+        let no_due = create_task(&state, "MixedCase no due", None, None, false, "slide").await;
+        let mut recurring_ids = Vec::new();
+        for (collapse, advance) in [
+            (false, "anchor"),
+            (false, "slide"),
+            (true, "anchor"),
+            (true, "slide"),
+        ] {
+            let name = format!("MixedCase recurring collapse={collapse} advance={advance}");
+            let id = create_task(
+                &state,
+                &name,
+                Some("2026-11-01"),
+                Some(json!({"kind": "daily"})),
+                collapse,
+                advance,
+            )
+            .await;
+            recurring_ids.push(id);
+        }
+        let active_decoy = create_task(
+            &state,
+            "Routine 100xyDone active",
+            Some("2026-11-03"),
+            None,
+            false,
+            "anchor",
+        )
+        .await;
+        let active_later = create_task(
+            &state,
+            "active later",
+            Some("2026-11-04"),
+            None,
+            false,
+            "anchor",
+        )
+        .await;
+
+        let mut archived_ids = vec![dated, no_due];
+        archived_ids.extend(recurring_ids.iter().copied());
+        for id in &archived_ids {
+            let (status, completion) = http_json(
+                &state,
+                Method::POST,
+                &format!("/tasks/{id}/complete"),
+                Some(json!({"at": "2026-11-01T12:00:00"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{completion}");
+        }
+
+        let mut archived_records = Vec::new();
+        for id in &archived_ids {
+            let (history_status, history) =
+                http_json(&state, Method::GET, &format!("/tasks/{id}/history"), None).await;
+            assert_eq!(history_status, StatusCode::OK, "{history}");
+            let (status, task) =
+                http_json(&state, Method::POST, &format!("/tasks/{id}/archive"), None).await;
+            assert_eq!(status, StatusCode::OK, "{task}");
+            assert_eq!(task["archived"], true);
+            archived_records.push((*id, task, history));
+        }
+
+        let (status, active_default) = http_json(&state, Method::GET, "/tasks", None).await;
+        assert_eq!(status, StatusCode::OK, "{active_default}");
+        let (status, active_false) =
+            http_json(&state, Method::GET, "/tasks?archived=false", None).await;
+        assert_eq!(status, StatusCode::OK, "{active_false}");
+        assert_eq!(
+            active_false, active_default,
+            "omitted archived preserves the old set/order"
+        );
+        assert_eq!(
+            active_default
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![active_decoy, active_later],
+            "existing due-date ordering remains unchanged"
+        );
+
+        let (status, archived_only) =
+            http_json(&state, Method::GET, "/tasks?archived=true", None).await;
+        assert_eq!(status, StatusCode::OK, "{archived_only}");
+        let archived_set = archived_only
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_i64().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(archived_set, archived_ids.iter().copied().collect());
+        let (status, all_tasks) = http_json(&state, Method::GET, "/tasks?archived=all", None).await;
+        assert_eq!(status, StatusCode::OK, "{all_tasks}");
+        let all_ids = all_tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let all_set = all_ids.iter().copied().collect::<BTreeSet<_>>();
+        let expected_union = archived_ids
+            .iter()
+            .copied()
+            .chain([active_decoy, active_later])
+            .collect::<BTreeSet<_>>();
+        assert_eq!(all_ids.len(), all_set.len(), "all must not duplicate tasks");
+        assert_eq!(
+            all_set, expected_union,
+            "all is the disjoint union of archived and active"
+        );
+        let (status, empty_query) =
+            http_json(&state, Method::GET, "/tasks?archived=true&q=", None).await;
+        assert_eq!(status, StatusCode::OK, "{empty_query}");
+        assert_eq!(empty_query, archived_only, "empty q is omitted");
+
+        for (path, expected) in [
+            ("/tasks?archived=true&q=RoUtInE", vec![dated]),
+            ("/tasks?archived=true&q=%25_", vec![dated]),
+            ("/tasks?archived=true&q=_", vec![dated]),
+        ] {
+            let (status, found) = http_json(&state, Method::GET, path, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {found}");
+            assert_eq!(
+                found
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|task| task["id"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                expected,
+                "name search is case-insensitive and treats %/_ literally: {path}"
+            );
+        }
+        let (status, mixed_case) =
+            http_json(&state, Method::GET, "/tasks?archived=true&q=mIxEd", None).await;
+        assert_eq!(status, StatusCode::OK, "{mixed_case}");
+        assert_eq!(mixed_case.as_array().unwrap().len(), 5);
+        let (status, no_match) = http_json(
+            &state,
+            Method::GET,
+            "/tasks?archived=true&q=unmatched",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{no_match}");
+        assert_eq!(no_match, json!([]));
+
+        let (status, composed_one_off) = http_json(
+            &state,
+            Method::GET,
+            "/tasks?archived=true&q=routine&due_before=2026-11-02&recurring=false&satisfied=true",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{composed_one_off}");
+        assert_eq!(
+            composed_one_off
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![dated]
+        );
+        let (status, composed_recurring) = http_json(
+            &state,
+            Method::GET,
+            "/tasks?archived=true&q=RECURRING&due_before=2026-11-02&recurring=true&satisfied=false",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{composed_recurring}");
+        assert_eq!(
+            composed_recurring
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_i64().unwrap())
+                .collect::<BTreeSet<_>>(),
+            recurring_ids.iter().copied().collect()
+        );
+
+        for (path, expected_message) in [
+            ("/tasks?bogus=1", "unknown query parameter: bogus"),
+            (
+                "/tasks?archived=maybe",
+                "archived must be false, true, or all",
+            ),
+        ] {
+            let (status, error) = http_json(&state, Method::GET, path, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {error}");
+            assert_eq!(error["error"], expected_message);
+        }
+        let (status, due_unknown) = http_json(
+            &state,
+            Method::GET,
+            "/tasks/due?as_of=2026-11-03&bogus=1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{due_unknown}");
+        assert_eq!(due_unknown["error"], "unknown query parameter: bogus");
+        let (status, due_valid) =
+            http_json(&state, Method::GET, "/tasks/due?as_of=2026-11-03", None).await;
+        assert_eq!(status, StatusCode::OK, "{due_valid}");
+        assert_eq!(
+            due_valid
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![active_decoy],
+            "due remains active-only"
+        );
+
+        for (id, archived_task, history_before) in &archived_records {
+            let (status, found) =
+                http_json(&state, Method::GET, &format!("/tasks/{id}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{found}");
+            assert_eq!(found, *archived_task);
+
+            let mut expected = archived_task.clone();
+            expected["archived"] = json!(false);
+            let (first_status, first) = http_json(
+                &state,
+                Method::POST,
+                &format!("/tasks/{id}/unarchive"),
+                None,
+            )
+            .await;
+            assert_eq!(first_status, StatusCode::OK, "{first}");
+            assert_eq!(first, expected, "only archived changes");
+            let (second_status, second) = http_json(
+                &state,
+                Method::POST,
+                &format!("/tasks/{id}/unarchive"),
+                None,
+            )
+            .await;
+            assert_eq!(second_status, StatusCode::OK, "{second}");
+            assert_eq!(second, first, "repeated unarchive is idempotent");
+            let (history_status, history_after) =
+                http_json(&state, Method::GET, &format!("/tasks/{id}/history"), None).await;
+            assert_eq!(history_status, StatusCode::OK, "{history_after}");
+            assert_eq!(
+                history_after, *history_before,
+                "occurrence rows are unchanged"
+            );
+        }
+
+        let (status, active_before) =
+            http_json(&state, Method::GET, &format!("/tasks/{active_later}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{active_before}");
+        assert_eq!(active_before["archived"], false);
+        let (status, active_once) = http_json(
+            &state,
+            Method::POST,
+            &format!("/tasks/{active_later}/unarchive"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{active_once}");
+        assert_eq!(active_once, active_before);
+        let (status, active_twice) = http_json(
+            &state,
+            Method::POST,
+            &format!("/tasks/{active_later}/unarchive"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{active_twice}");
+        assert_eq!(active_twice, active_before);
+
+        let (status, missing_get) =
+            http_json(&state, Method::GET, "/tasks/9223372036854775807", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing_get}");
+        let (status, missing_unarchive) = http_json(
+            &state,
+            Method::POST,
+            "/tasks/9223372036854775807/unarchive",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing_unarchive}");
+        let (status, no_archived_left) =
+            http_json(&state, Method::GET, "/tasks?archived=true", None).await;
+        assert_eq!(status, StatusCode::OK, "{no_archived_left}");
+        assert_eq!(no_archived_left, json!([]));
     }
 
     #[tokio::test]

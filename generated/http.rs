@@ -25,6 +25,8 @@ pub const GENERATED_ROUTES: &[GeneratedRoute] = &[
     GeneratedRoute { name: "task_create", method: "POST", path: "/tasks" },
     GeneratedRoute { name: "task_update", method: "POST", path: "/tasks/{task_id}/update" },
     GeneratedRoute { name: "task_archive", method: "POST", path: "/tasks/{task_id}/archive" },
+    GeneratedRoute { name: "task_get", method: "GET", path: "/tasks/{task_id}" },
+    GeneratedRoute { name: "task_unarchive", method: "POST", path: "/tasks/{task_id}/unarchive" },
     GeneratedRoute { name: "task_list", method: "GET", path: "/tasks" },
     GeneratedRoute { name: "task_complete", method: "POST", path: "/tasks/{task_id}/complete" },
     GeneratedRoute { name: "tasks_due", method: "GET", path: "/tasks/due" },
@@ -37,6 +39,8 @@ pub fn generated_router() -> Router<crate::AppState> {
         .route("/tasks", post(task_create))
         .route("/tasks/{task_id}/update", post(task_update))
         .route("/tasks/{task_id}/archive", post(task_archive))
+        .route("/tasks/{task_id}", get(task_get))
+        .route("/tasks/{task_id}/unarchive", post(task_unarchive))
         .route("/tasks", get(task_list))
         .route("/tasks/{task_id}/complete", post(task_complete))
         .route("/tasks/due", get(tasks_due))
@@ -84,6 +88,38 @@ async fn task_archive(
     crate::execute_operation_http(
         &state,
         "task_archive",
+        GeneratedOperationInput {
+            path,
+            query: BTreeMap::new(),
+            body: Value::Null,
+        },
+    )
+    .await
+}
+
+async fn task_get(
+    State(state): State<crate::AppState>,
+    Path(path): Path<BTreeMap<String, String>>,
+) -> Response {
+    crate::execute_operation_http(
+        &state,
+        "task_get",
+        GeneratedOperationInput {
+            path,
+            query: BTreeMap::new(),
+            body: Value::Null,
+        },
+    )
+    .await
+}
+
+async fn task_unarchive(
+    State(state): State<crate::AppState>,
+    Path(path): Path<BTreeMap<String, String>>,
+) -> Response {
+    crate::execute_operation_http(
+        &state,
+        "task_unarchive",
         GeneratedOperationInput {
             path,
             query: BTreeMap::new(),

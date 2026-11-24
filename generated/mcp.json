@@ -16,16 +16,24 @@
       "name": "body",
       "recurrence": "body"
     },
+    "task_get": {
+      "task_id": "path"
+    },
     "task_history": {
       "task_id": "path"
     },
     "task_list": {
+      "archived": "query",
       "due_before": "query",
+      "q": "query",
       "recurring": "query",
       "satisfied": "query"
     },
     "task_streak": {
       "as_of": "query",
+      "task_id": "path"
+    },
+    "task_unarchive": {
       "task_id": "path"
     },
     "task_update": {
@@ -146,12 +154,54 @@
       "name": "task_archive"
     },
     {
-      "description": "List active tasks with explicit optional filters. The optional satisfied filter selects one-off tasks only; omitted or all preserves the current list.",
+      "description": "Read one task by stable ID, including archived tasks.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "task_id": {
+            "description": "Stable task ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "task_get"
+    },
+    {
+      "description": "Restore an archived task without changing its fields or occurrence history; active tasks are unchanged.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "description": "Stable task ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "task_unarchive"
+    },
+    {
+      "description": "List tasks with explicit optional filters. Archived false is the default; q is a literal case-insensitive name substring. The optional satisfied filter selects one-off tasks only.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "archived": {
+            "description": "Select false for active tasks by default; true for archived tasks; all for both",
+            "type": "string"
+          },
           "due_before": {
             "description": "Include only tasks due on or before this UTC date",
+            "type": "string"
+          },
+          "q": {
+            "description": "Case-insensitive literal substring of the task name; empty is omitted",
             "type": "string"
           },
           "recurring": {
