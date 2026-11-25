@@ -79,6 +79,15 @@ fn path_i64(input: &generated::GeneratedOperationInput, key: &str) -> Result<i64
 fn query<'a>(input: &'a generated::GeneratedOperationInput, key: &str) -> Option<&'a str> {
     input.query.get(key).map(String::as_str)
 }
+fn query_parameter(value: &Value) -> Option<String> {
+    if value.is_null() {
+        None
+    } else if let Some(string) = value.as_str() {
+        Some(string.to_owned())
+    } else {
+        Some(value.to_string())
+    }
+}
 fn reject_unknown_query(
     input: &generated::GeneratedOperationInput,
     allowed: &[&str],
@@ -368,8 +377,8 @@ pub async fn run_cli() -> anyhow::Result<()> {
                 path.insert(key.clone(), param.as_str().unwrap_or_default().to_owned());
             }
             Some("query") => {
-                if !param.is_null() {
-                    query.insert(key.clone(), param.to_string().trim_matches('"').to_owned());
+                if let Some(value) = query_parameter(&param) {
+                    query.insert(key.clone(), value);
                 }
             }
             Some("body") => {
@@ -421,9 +430,10 @@ pub async fn run_mcp() -> anyhow::Result<()> {
                         Some("path") => {
                             path.insert(key, value.as_str().unwrap_or_default().to_owned());
                         }
-                        Some("query") if value.is_null() => {}
                         Some("query") => {
-                            query.insert(key, value.to_string().trim_matches('"').to_owned());
+                            if let Some(value) = query_parameter(&value) {
+                                query.insert(key, value);
+                            }
                         }
                         Some("body") => {
                             body.insert(key, value);
@@ -452,6 +462,17 @@ pub async fn run_mcp() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_parameters_preserve_decoded_strings_and_serialize_scalars() {
+        assert_eq!(
+            query_parameter(&json!("C:\\Inbox \"Today\"\nLater")),
+            Some("C:\\Inbox \"Today\"\nLater".to_owned())
+        );
+        assert_eq!(query_parameter(&json!(false)), Some("false".to_owned()));
+        assert_eq!(query_parameter(&json!(12)), Some("12".to_owned()));
+        assert_eq!(query_parameter(&Value::Null), None);
+    }
 
     #[test]
     fn http_bind_defaults_to_loopback_and_accepts_container_override() {
