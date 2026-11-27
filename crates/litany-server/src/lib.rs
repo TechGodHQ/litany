@@ -79,6 +79,15 @@ fn path_i64(input: &generated::GeneratedOperationInput, key: &str) -> Result<i64
 fn query<'a>(input: &'a generated::GeneratedOperationInput, key: &str) -> Option<&'a str> {
     input.query.get(key).map(String::as_str)
 }
+fn query_parameter(value: &Value) -> Option<String> {
+    if value.is_null() {
+        None
+    } else if let Some(string) = value.as_str() {
+        Some(string.to_owned())
+    } else {
+        Some(value.to_string())
+    }
+}
 fn reject_unknown_query(
     input: &generated::GeneratedOperationInput,
     allowed: &[&str],
@@ -343,19 +352,6 @@ fn configured_http_bind() -> String {
     http_bind_from(std::env::var("LITANY_HTTP_BIND").ok())
 }
 
-/// Renders one query-located parameter value as the string the shared
-/// dispatcher expects. String scalars pass through verbatim, so literal
-/// query text — quotes, SQL wildcard characters, every other byte —
-/// reaches the store exactly as typed instead of being JSON-encoded and
-/// then crudely de-quoted. Non-string values keep the existing JSON-text
-/// rendering; omitted (null) values never reach this helper.
-fn query_param_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string().trim_matches('\"').to_owned(),
-    }
-}
-
 pub async fn run_cli() -> anyhow::Result<()> {
     use clap::Parser;
     #[derive(Parser)]
@@ -381,8 +377,8 @@ pub async fn run_cli() -> anyhow::Result<()> {
                 path.insert(key.clone(), param.as_str().unwrap_or_default().to_owned());
             }
             Some("query") => {
-                if !param.is_null() {
-                    query.insert(key.clone(), query_param_text(&param));
+                if let Some(value) = query_parameter(&param) {
+                    query.insert(key.clone(), value);
                 }
             }
             Some("body") => {
@@ -434,9 +430,10 @@ pub async fn run_mcp() -> anyhow::Result<()> {
                         Some("path") => {
                             path.insert(key, value.as_str().unwrap_or_default().to_owned());
                         }
-                        Some("query") if value.is_null() => {}
                         Some("query") => {
-                            query.insert(key, query_param_text(&value));
+                            if let Some(value) = query_parameter(&value) {
+                                query.insert(key, value);
+                            }
                         }
                         Some("body") => {
                             body.insert(key, value);
@@ -467,36 +464,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn query_parameters_preserve_decoded_strings_and_serialize_scalars() {
+        assert_eq!(
+            query_parameter(&json!("C:\\Inbox \"Today\"\nLater")),
+            Some("C:\\Inbox \"Today\"\nLater".to_owned())
+        );
+        assert_eq!(query_parameter(&json!(false)), Some("false".to_owned()));
+        assert_eq!(query_parameter(&json!(12)), Some("12".to_owned()));
+        assert_eq!(query_parameter(&Value::Null), None);
+    }
+
+    #[test]
     fn http_bind_defaults_to_loopback_and_accepts_container_override() {
         assert_eq!(http_bind_from(None), DEFAULT_HTTP_BIND);
         assert_eq!(
             http_bind_from(Some("0.0.0.0:8941".to_owned())),
             "0.0.0.0:8941"
         );
-    }
-
-    #[test]
-    fn query_param_text_passes_string_scalars_through_verbatim() {
-        for literal in [
-            "100%_Done",
-            "quote \"inside\" name",
-            "back\\slash",
-            "\"quoted\"",
-            "trailing quote\"",
-            "tab\tnewline\n",
-            "",
-        ] {
-            assert_eq!(query_param_text(&json!(literal)), literal);
-        }
-        // Non-string values keep the existing JSON-text rendering.
-        assert_eq!(query_param_text(&json!(true)), "true");
-        assert_eq!(query_param_text(&json!(false)), "false");
-        assert_eq!(query_param_text(&json!(17)), "17");
-        assert_eq!(
-            query_param_text(&json!({"kind": "daily"})),
-            "{\"kind\":\"daily\"}"
-        );
-        assert_eq!(query_param_text(&json!([1, 2])), "[1,2]");
     }
 
     #[tokio::test]
